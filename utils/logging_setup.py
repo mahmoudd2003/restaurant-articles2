@@ -1,36 +1,34 @@
-# utils/logging_setup.py
-import logging
-from typing import Optional
+import logging, sys, uuid
+from contextlib import contextmanager
 
-_CORR_ID = "-"
+_corr = {"id": "-"}
 
-class _CIDFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.correlation_id = _CORR_ID
-        record.app = "restoguide"
-        return True
-
-_logger: Optional[logging.Logger] = None
-
-def init_logging(app_name: str = "restoguide", level: str = "INFO"):
-    global _logger
-    _logger = logging.getLogger(app_name)
-    if not _logger.handlers:
-        h = logging.StreamHandler()
-        fmt = "%(asctime)s | %(levelname)-7s | %(app)s | %(correlation_id)s | %(name)s | %(message)s"
-        h.setFormatter(logging.Formatter(fmt))
-        h.addFilter(_CIDFilter())
-        _logger.addHandler(h)
-    _logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-def get_logger(name: str = "app") -> logging.Logger:
-    if _logger is None:
-        init_logging()
-    return logging.getLogger(name)
+def init_logging(app_name="app", level="INFO"):
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(levelname)s | %(name)s | %(message)s",
+        stream=sys.stdout,
+    )
+    logging.getLogger(app_name).info("logging initialized")
 
 def set_correlation_id(cid: str):
-    global _CORR_ID
-    _CORR_ID = cid
+    _corr["id"] = cid
 
-def log_exception(e: Exception):
-    get_logger("app").exception(e)
+def get_logger(name: str):
+    return logging.getLogger(name)
+
+def with_context(msg: str) -> str:
+    return f"{_corr.get('id','-')} | {msg}"
+
+def log_exception(logger, e: Exception):
+    logger.error(with_context(f"exception: {e}"))
+
+@contextmanager
+def context(logger, label):
+    logger.info(with_context(f"{label}.start"))
+    try:
+        yield
+        logger.info(with_context(f"{label}.done"))
+    except Exception as e:
+        logger.exception(with_context(f"{label}.error: {e}"))
+        raise
