@@ -1,486 +1,465 @@
-# app.py (نسخة مستقلة ومُصلحة)
+# app.py
 # -*- coding: utf-8 -*-
-# --- تثبيت مسار المشروع على sys.path لحل مشاكل الاستيراد الداخلية ---
-import os, sys
+
+# =============================
+#  تثبيت مسار المشروع للاستيراد
+# =============================
+import os, sys, uuid, json, time, hashlib
+from typing import List, Dict, Any, Optional, Tuple
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-# ---------------------------------------------------------------------
 
-import os, json, math, logging, hashlib, time, unicodedata
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
+# ===========
+#  استيرادات
+# ===========
 import streamlit as st
 
-# =============== إعداد عام ===============
-st.set_page_config(page_title="مولد مقالات المطاعم", page_icon="🍽️", layout="wide")
+# --------------- بدائل / لوجينغ ---------------
+try:
+    from utils.logging_setup import (
+        init_logging,
+        get_logger,
+        set_correlation_id,
+        with_context,
+        log_exception,
+    )
+except Exception:
+    import logging
+
+    _logger = logging.getLogger("restoguide")
+    if not _logger.handlers:
+        h = logging.StreamHandler()
+        fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
+        h.setFormatter(fmt)
+        _logger.addHandler(h)
+        _logger.setLevel(logging.INFO)
+
+    def init_logging(app_name: str = "restoguide", level: str = "INFO"):
+        _logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    def get_logger(name: str = "app"):
+        return _logger
+
+    def set_correlation_id(_cid: str):
+        # no-op fallback
+        pass
+
+    def with_context(**kwargs):
+        # decorator fallback
+        def deco(fn):
+            def wrapper(*a, **k):
+                return fn(*a, **k)
+            return wrapper
+        return deco
+
+    def log_exception(e: Exception):
+        _logger.exception(e)
+
+# --------------- بدائل / جلب محتوى ---------------
+try:
+    from utils.content_fetch import fetch_and_extract, configure_http_cache
+except Exception:
+    # Fallback بسيط يعتمد على requests + trafilatura/bs4 إن وُجدت
+    def configure_http_cache(ttl_hours: int = 24, enabled: bool = True):
+        try:
+            if enabled:
+                import requests_cache
+                requests_cache.install_cache(
+                    cache_name="http_cache",
+                    expire_after=ttl_hours * 3600,
+                )
+        except Exception:
+            pass
+
+    def fetch_and_extract(url: str) -> Dict[str, Any]:
+        """محاولة جلب نص الصفحة. Fallback بسيط."""
+        try:
+            import requests
+            from bs4 import BeautifulSoup  # type: ignore
+        except Exception:
+            return {"url": url, "title": "", "text": ""}
+
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            title = ""
+            text = ""
+            try:
+                from trafilatura import extract  # type: ignore
+                text = extract(resp.text) or ""
+            except Exception:
+                soup = BeautifulSoup(resp.text, "lxml")
+                title_tag = soup.find("title")
+                title = title_tag.get_text(strip=True) if title_tag else ""
+                text = soup.get_text(" ", strip=True)
+            return {"url": url, "title": title, "text": text}
+        except Exception:
+            return {"url": url, "title": "", "text": ""}
+
+# --------------- بدائل / عميل OpenAI ---------------
+try:
+    from utils.openai_client import get_client, chat_complete_cached
+except Exception:
+    # Fallback يعتمد على openai==1.x
+    def get_client():
+        from openai import OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        return OpenAI(api_key=api_key)
+
+    def chat_complete_cached(messages: List[Dict[str, Any]], model: str = "gpt-4o-mini", **kwargs):
+        client = get_client()
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=kwargs.get("temperature", 0.2),
+            max_tokens=kwargs.get("max_tokens"),
+            top_p=kwargs.get("top_p", 1),
+            presence_penalty=kwargs.get("presence_penalty"),
+            frequency_penalty=kwargs.get("frequency_penalty"),
+            seed=kwargs.get("seed"),
+        )
+
+# --------------- بدائل / التصدير ---------------
+try:
+    from utils.exporters import to_docx, to_json
+except Exception:
+    def to_docx(article_text: str, filename: str) -> str:
+        try:
+            from docx import Document  # python-docx
+        except Exception:
+            # بديل بسيط: أنشئ ملف txt بنفس الاسم
+            path = os.path.join("data", filename.replace(".docx", ".txt"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(article_text)
+            return path
+
+        doc = Document()
+        for line in article_text.splitlines():
+            doc.add_paragraph(line if line.strip() else "")
+        os.makedirs("data", exist_ok=True)
+        path = os.path.join("data", filename)
+        doc.save(path)
+        return path
+
+    def to_json(data: Any, filename: str) -> str:
+        os.makedirs("data", exist_ok=True)
+        path = os.path.join("data", filename)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return path
+
+# --------------- بدائل / تحليل منافسين + جودة ---------------
+try:
+    from utils.competitor_analysis import analyze_competitors, extract_gap
+except Exception:
+    def analyze_competitors(texts: List[str]) -> Dict[str, Any]:
+        return {"summary": "n/a", "keywords": [], "gaps": []}
+
+    def extract_gap(analysis: Dict[str, Any]) -> List[str]:
+        return analysis.get("gaps", [])
+
+try:
+    from utils.quality_checks import quality_report
+except Exception:
+    def quality_report(text: str) -> Dict[str, Any]:
+        return {"readability": "n/a", "coverage": "n/a", "notes": []}
+
+# ===========
+#  تهيئة عام
+# ===========
 os.makedirs("data", exist_ok=True)
-os.makedirs("logs", exist_ok=True)
+init_logging(app_name="restoguide", level=os.getenv("LOG_LEVEL", "INFO"))
+logger = get_logger("app")
+set_correlation_id(str(uuid.uuid4())[:8])
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | app | %(message)s",
-)
-logger = logging.getLogger("app")
+# =========
+#  Helpers
+# =========
+def parse_urls_block(block: str) -> List[str]:
+    urls = []
+    for line in (block or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(("http://", "https://")):
+            urls.append(s)
+    return urls
 
-# =============== أدوات مساعدة ===============
-def slugify(name: str) -> str:
-    s = ''.join(c for c in unicodedata.normalize('NFKD', name or "") if not unicodedata.combining(c))
-    import re as _re
-    s = _re.sub(r'\W+', '-', s).strip('-').lower()
-    return s or "item"
+def normalize_json_or_text(s: str) -> Tuple[Optional[Any], str]:
+    """
+    يحاول قراءة s كـ JSON إذا بدأ بـ { أو [  (تصحيح الأقواس هنا!)
+    """
+    s = (s or "").strip()
+    if not s:
+        return None, ""
+    try:
+        # مهم: tuple وليس list لتفادي الـ SyntaxError
+        if s.startswith(("[", "{")):
+            return json.loads(s), ""
+    except Exception:
+        pass
+    return None, s
 
-def _normalize_lines(s: str) -> List[str]:
-    return [ln.strip() for ln in (s or "").splitlines() if ln.strip()]
+def hash_messages(messages: List[Dict[str, Any]], model: str) -> str:
+    raw = json.dumps({"m": messages, "model": model}, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-# —— كاش LLM بسيط داخل الجلسة —— 
-class SimpleLLMCache:
-    def __init__(self, enabled=True, ttl_hours=24):
-        self.enabled = enabled
+# ---------------
+#  كاش LLM بسيط
+# ---------------
+class LLMCacher:
+    def __init__(self, ttl_hours: int = 24):
         self.ttl = ttl_hours * 3600
-        if "llm_cache_store" not in st.session_state:
-            st.session_state["llm_cache_store"] = {}
+        self.mem: Dict[str, Tuple[float, Any]] = {}
 
-    def _key(self, payload: Dict[str, Any]) -> str:
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
-
-    def get(self, payload: Dict[str, Any]) -> Optional[str]:
-        if not self.enabled: return None
-        key = self._key(payload)
-        item = st.session_state["llm_cache_store"].get(key)
-        if not item: return None
-        ts, val = item
+    def get(self, key: str):
+        row = self.mem.get(key)
+        if not row:
+            return None
+        ts, val = row
         if time.time() - ts > self.ttl:
-            st.session_state["llm_cache_store"].pop(key, None)
+            self.mem.pop(key, None)
             return None
         return val
 
-    def set(self, payload: Dict[str, Any], value: str):
-        if not self.enabled: return
-        key = self._key(payload)
-        st.session_state["llm_cache_store"][key] = (time.time(), value)
+    def set(self, key: str, value: Any):
+        self.mem[key] = (time.time(), value)
 
-# —— تهيئة الكاش —— 
-if "llm_cache" not in st.session_state:
-    st.session_state["llm_cache"] = SimpleLLMCache(enabled=True, ttl_hours=24)
+# =========
+#  واجهة UI
+# =========
+st.set_page_config(page_title="RestoGuide", page_icon="🍽️", layout="wide")
+st.title("🍽️ مُولّد مقالات المطاعم (RestoGuide)")
 
-# —— OpenAI عميل مبسط —— 
-def _has_api_key() -> bool:
-    try:
-        return bool((hasattr(st, "secrets") and st.secrets.get("OPENAI_API_KEY")) or os.getenv("OPENAI_API_KEY"))
-    except Exception:
-        return bool(os.getenv("OPENAI_API_KEY"))
+st.markdown(
+    "هذا التطبيق يُولّد مقالات/أدلة مطاعم بالاعتماد على محتوى مواقع وروابط تُزوّدها أنت، "
+    "مع دعم تحليل منافسين وفحص جودة اختياري."
+)
 
-def _get_openai_client():
-    # لا نُنشئ dependency على وحدات خارجية
-    from openai import OpenAI
-    api_key = (st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("OPENAI_API_KEY")
-    return OpenAI(api_key=api_key)
+# Sidebar — إعدادات عامة
+st.sidebar.header("⚙️ الإعدادات")
 
-def chat_complete_cached(messages: List[Dict[str, str]], model: str, max_tokens=2000, temperature=0.7) -> str:
-    payload = {"messages": messages, "model": model, "max_tokens": max_tokens, "temperature": temperature}
-    cache = st.session_state["llm_cache"]
-    hit = cache.get(payload)
-    if hit is not None:
-        return hit
-    client = _get_openai_client()
-    # نستخدم واجهة Chat القديمة المتوافقة مع openai>=1.0
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
+# كاش HTTP
+st.sidebar.subheader("🛰️ كاش HTTP")
+http_cache_enabled = st.sidebar.checkbox("تفعيل كاش HTTP", value=True, key="http_cache_enabled")
+http_cache_hours = st.sidebar.slider("مدة (ساعات)", 1, 72, 24, key="http_cache_hours")
+configure_http_cache(ttl_hours=int(http_cache_hours), enabled=bool(http_cache_enabled))
+
+st.sidebar.markdown("---")
+
+# كاش LLM
+st.sidebar.subheader("🧠 كاش LLM")
+llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش LLM", value=True, key="llm_cache_enabled")
+llm_cache_hours = st.sidebar.slider("مدة (ساعات)", 1, 72, 24, key="llm_cache_hours")
+
+if "llm_cacher" not in st.session_state:
+    st.session_state["llm_cacher"] = LLMCacher(ttl_hours=int(llm_cache_hours))
+else:
+    # حدّث TTL إذا تغيّر
+    st.session_state["llm_cacher"].ttl = int(llm_cache_hours) * 3600
+
+# إعدادات LLM
+st.sidebar.subheader("🤖 نموذج الذكاء")
+model_name = st.sidebar.selectbox(
+    "النموذج",
+    ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+    index=0,
+    key="model_name",
+)
+temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.2, 0.1, key="temperature")
+max_tokens = st.sidebar.slider("Max Tokens", 256, 8192, 2048, 64, key="max_tokens")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("تأكد من تعيين `OPENAI_API_KEY` في إعدادات التشغيل.")
+
+# Main inputs
+st.subheader("🧾 بيانات المقال")
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    topic = st.text_input("الموضوع/الفئة (مثال: أفضل مطاعم برجر في الرياض)", key="topic")
+    area = st.text_input("المدينة/النطاق الجغرافي (اختياري)", key="area")
+    tone = st.selectbox(
+        "النبرة الكتابية",
+        ["احترافية", "حماسية", "ودّية", "مختصرة", "سياحية"],
+        index=0,
+        key="tone",
     )
-    text = resp.choices[0].message.content.strip()
-    cache.set(payload, text)
+    length = st.selectbox("الطول التقريبي", ["قصير", "متوسط", "طويل"], index=1, key="length")
+
+with col2:
+    do_comp = st.checkbox("تشغيل تحليل المنافسين", value=False, key="do_comp")
+    do_quality = st.checkbox("تشغيل فحص الجودة", value=True, key="do_quality")
+    out_docx = st.checkbox("توليد ملف DOCX", value=True, key="out_docx")
+    out_json = st.checkbox("توليد ملف JSON", value=True, key="out_json")
+
+st.subheader("🔗 روابط مصادر (واحدة في كل سطر)")
+urls_block = st.text_area("ألصق روابط مقالات/قوائم مطاعم", height=120, key="urls_block")
+urls = parse_urls_block(urls_block)
+
+st.subheader("📝 ملاحظات/تعليمات إضافية (اختياري)")
+notes = st.text_area("اكتب أي تعليمات خاصة ترغب تضمينها في المقال", height=100, key="notes")
+
+generate = st.button("🚀 توليد المقال الآن", type="primary", use_container_width=False)
+
+# ==========================
+#       منطق التوليد
+# ==========================
+def build_prompt(topic: str, area: str, tone: str, length: str, notes: str, sources: List[Dict[str, Any]]):
+    sys_prompt = (
+        "أنت محرّر محتوى مختص في أدلة المطاعم. اكتب مقالات عربية واضحة، مُحايدة، "
+        "متوافقة مع أفضل ممارسات السيو، مع عناوين فرعية ونِقاط وقوائم حيث يلزم."
+    )
+
+    user_parts = []
+    if topic:
+        user_parts.append(f"الموضوع: {topic}")
+    if area:
+        user_parts.append(f"النطاق الجغرافي: {area}")
+    user_parts.append(f"النبرة: {tone}")
+    user_parts.append(f"الطول: {length}")
+
+    if notes.strip():
+        user_parts.append(f"ملاحظات إضافية: {notes.strip()}")
+
+    if sources:
+        src_short = []
+        for s in sources:
+            title = (s.get("title") or "").strip()
+            url = s.get("url") or ""
+            txt = (s.get("text") or "")[:1200]
+            src_short.append({"title": title, "url": url, "snippet": txt})
+        user_parts.append("ملخص للمصادر (عينة):\n" + json.dumps(src_short, ensure_ascii=False, indent=2))
+
+    return [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": "\n\n".join(user_parts)},
+    ]
+
+def call_llm(messages: List[Dict[str, Any]], model: str) -> str:
+    cache_key = hash_messages(messages, model)
+    if llm_cache_enabled:
+        cached = st.session_state["llm_cacher"].get(cache_key)
+        if cached:
+            return cached
+
+    resp = chat_complete_cached(messages=messages, model=model, temperature=temperature, max_tokens=max_tokens)
+    # متوافق مع openai==1.x
+    text = ""
+    try:
+        text = resp.choices[0].message.content  # type: ignore
+    except Exception:
+        text = str(resp)
+
+    if llm_cache_enabled:
+        st.session_state["llm_cacher"].set(cache_key, text)
     return text
 
-# —— استبدال use_container_width —— 
-TABLE_WIDTH = 'stretch'  # أو 'content'
-
-# =============== قوالب برومبتات مختصرة (مدمجة) ===============
-BASE_TMPL = """# {title}
-> الكلمة المفتاحية: {keyword}
-> الأسلوب: {tone_label}
-> ملاحظة: التزم بإحالات [^n] عند الاستشهاد بالمراجع.
-
-## لماذا هذه القائمة؟
-{tone_selection_line}
-
-## المعايير
-{criteria_block}
-
-## الأماكن المرشحة
-(استخدم الإحالات [^n] عند ذكر بيانات من القائمة أدناه.)
-
-## المنهجية
-{methodology_block}
-
-## ملاحظات
-{protip_hint}
-"""
-
-POLISH_TMPL = """أعد تحرير النص التالي لتحسين السلاسة، تقليل الحشو، والحفاظ على المعنى والحقائق. إذا وُجدت ملاحظات كاتب، دمجها بلطف.
-[ملاحظات الكاتب]: {user_notes}
-
-[النص]:
-{article}
-"""
-
-FAQ_TMPL = """### الأسئلة الشائعة
-- ما أفضل وقت للزيارة؟
-- هل تتوفر جلسات خارجية؟
-- هل المكان مناسب للعائلات؟
-"""
-
-GENERAL_CRITERIA = """- جودة المكونات
-- الاتساق عبر الزيارات
-- السعر مقابل القيمة
-- النظافة وسرعة الخدمة
-"""
-
-# =============== وظائف بيانات الأماكن (بديل مبسط) ===============
-def _dedupe_places(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen, out = set(), []
-    for r in rows:
-        k = (r.get("phone") or "").strip() or (r.get("website") or "").strip() or slugify(r.get("name") or "")
-        if k and k not in seen:
-            seen.add(k); out.append(r)
-    return out
-
-def _score_place(row: Dict[str, Any], keyword: str) -> float:
-    rating = float(row.get("rating") or 0.0)
-    reviews = max(1, int(row.get("reviews_count") or 1))
-    base = rating * math.log(reviews + 1.0)
-    name = (row.get("name") or "").lower()
-    kw = (keyword or "").lower().strip()
-    boost_kw = 0.6 if kw and kw in name else 0.0
-    boost_open = 0.3 if row.get("open_now") else 0.0
-    return round(base + boost_kw + boost_open, 4)
-
-def _extract_thursday_hours(row: Dict[str, Any]) -> str:
-    hours_map = row.get("hours_map") or {}
-    for key in ["الخميس", "Thursday", "Thu"]:
-        if key in hours_map and hours_map[key]:
-            return hours_map[key]
-    ht = (row.get("hours_today") or "").strip()
-    if "الخميس" in ht or "Thursday" in ht or "Thu" in ht:
-        return ht.split(":", 1)[-1].strip()
-    return "—"
-
-def _build_references(rows: List[Dict[str, Any]]) -> List[str]:
-    refs = []
-    for r in rows:
-        google_url = r.get("google_url") or r.get("gmaps_url") or "—"
-        site = r.get("website") or "—"
-        if site and site != "—":
-            refs.append(f"{r.get('name','?')}: Google Maps {google_url} — Website {site}")
-        else:
-            refs.append(f"{r.get('name','?')}: Google Maps {google_url}")
-    return refs
-
-def search_places(keyword: str, city: str, min_reviews: int = 50) -> List[Dict[str, Any]]:
-    """
-    بديل مبسّط: يرجّع بيانات افتراضية إذا لم يتوفر لديك موفّر خارجي.
-    يمكنك لاحقًا استبداله بدمج Google Places API.
-    """
-    logger.info("places.request")
-    sample = [
-        {"name": "Burger Craft", "address": f"{city} - الحي الشمالي", "phone": "0500000001",
-         "website": "", "google_url": "https://maps.google.com/?q=Burger+Craft",
-         "rating": 4.4, "reviews_count": 310, "price_band": "متوسط", "open_now": True,
-         "hours_map": {"Thursday": "12:00–02:00"}},
-        {"name": "Smash House", "address": f"{city} - الوسطى", "phone": "0500000002",
-         "website": "https://smash.example", "google_url": "https://maps.google.com/?q=Smash+House",
-         "rating": 4.2, "reviews_count": 190, "price_band": "اقتصادي", "open_now": False,
-         "hours_map": {"الخميس": "13:00–01:00"}},
-        {"name": "Flame & Bun", "address": f"{city} - الغربية", "phone": "0500000003",
-         "website": "", "google_url": "https://maps.google.com/?q=Flame+%26+Bun",
-         "rating": 4.6, "reviews_count": 520, "price_band": "مرتفع", "open_now": True,
-         "hours_map": {"Thu": "14:00–03:00"}},
-    ]
-    rows = [r for r in sample if int(r["reviews_count"]) >= min_reviews]
-    logger.info("places.dedupe")
-    return _dedupe_places(rows)
-
-# =============== دوال معايير الاختيار ===============
-def _criteria_normalize(raw) -> List[str]:
-    """
-    إصلاح كامل لخطأ الأقواس: لا نستعمل startswith(tuple).
-    نتعامل مع أنواع مختلفة ونرمي "undefined".
-    """
-    if raw is None:
+def fetch_sources(urls: List[str]) -> List[Dict[str, Any]]:
+    if not urls:
         return []
-    if isinstance(raw, str):
-        s = raw.strip()
-        # إذا كانت JSON-like: اعتمد فحص الحرف الأول فقط
-        if s and s[0] in "[{":
-            try:
-                raw = json.loads(s)
-            except Exception:
-                lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
-                return [ln for ln in lines if ln and ln.lower() != "undefined"]
-        else:
-            lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
-            return [ln for ln in lines if ln and ln.lower() != "undefined"]
-    if isinstance(raw, dict):
-        for k in ("criteria", "bullets", "items", "list"):
-            if k in raw:
-                raw = raw[k]; break
-        else:
-            vals = list(raw.values())
-            raw = vals if all(isinstance(v, str) for v in vals) else list(raw.keys())
-    if isinstance(raw, (list, tuple)):
-        out = []
-        for x in raw:
-            if isinstance(x, str):
-                t = x.strip().strip(",").strip('"').strip("'")
-            elif isinstance(x, dict) and "text" in x:
-                t = str(x["text"]).strip()
-            else:
-                t = str(x).strip()
-            if t and t.lower() != "undefined":
-                out.append(t)
-        return out
-    return [str(raw)]
+    logger.info("restoguide | %s | app | places.fetch.start", str(uuid.uuid4())[:8])
+    out = []
+    for i, u in enumerate(urls):
+        logger.info("restoguide | - | places | places.request")
+        data = fetch_and_extract(u)
+        out.append(data)
+    # إزالة تكرارات حسب URL
+    dedup = {}
+    for row in out:
+        dedup[row.get("url")] = row
+    logger.info("restoguide | - | places | places.dedupe")
+    rows = list(dedup.values())
+    logger.info("restoguide | - | app | places.fetch.done")
+    return rows
 
-def _format_criteria_md(items) -> str:
-    items = _criteria_normalize(items)
-    return "\n".join(f"- {c}" for c in items) or "- —"
+def export_outputs(article_text: str, meta: Dict[str, Any]):
+    downloads = []
+    if out_docx:
+        docx_name = f"article_{int(time.time())}.docx"
+        path = to_docx(article_text, docx_name)
+        downloads.append(("DOCX", path))
+    if out_json:
+        json_name = f"article_{int(time.time())}.json"
+        path = to_json(meta, json_name)
+        downloads.append(("JSON", path))
+    return downloads
 
-# =============== واجهة التطبيق ===============
-st.title("🍽️ مولّد مقالات المطاعم—(نسخة مستقلة)")
+# ==========================
+#         التنفيذ
+# ==========================
+if generate:
+    if not topic.strip():
+        st.error("يرجى إدخال موضوع/فئة للمقال.")
+        st.stop()
 
-# ——— الشريط الجانبي: إعدادات عامة ———
-st.sidebar.header("⚙️ الإعدادات")
-tone = st.sidebar.selectbox("نغمة الأسلوب",
-    ["ناقد ودود","ناقد صارم","دليل تحريري محايد"], index=0, key="tone_select")
-primary_model = st.sidebar.selectbox("الموديل", ["gpt-4.1","gpt-4o","gpt-4o-mini"], index=1, key="model_primary")
-approx_len = st.sidebar.slider("الطول التقريبي (كلمات)", 600, 1800, 1100, step=100, key="approx_len_slider")
-include_faq = st.sidebar.checkbox("إضافة FAQ", value=True, key="include_faq_chk")
-include_methodology = st.sidebar.checkbox("إضافة منهجية التحرير", value=True, key="include_methodology_chk")
+    # جلب المصادر (إن وجدت روابط)
+    sources = fetch_sources(urls) if urls else []
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🧠 كاش LLM")
-llm_cache_enabled = st.sidebar.checkbox("تفعيل الكاش", value=True, key="llm_cache_enabled_chk")
-llm_cache_hours = st.sidebar.slider("مدة الكاش (ساعات)", 1, 72, 24, key="llm_cache_hours_slider")
-st.session_state["llm_cache"].enabled = llm_cache_enabled
-st.session_state["llm_cache"].ttl = llm_cache_hours * 3600
+    # رسائل LLM
+    msgs = build_prompt(topic=topic, area=area, tone=tone, length=length, notes=notes, sources=sources)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔗 كلمات إلزامية")
-mandatory_terms = _normalize_lines(st.sidebar.text_area(
-    "عبارات إلزامية (سطر لكل عنصر)",
-    value="مطاعم عائلية\nجلسات خارجية\nمواقف سيارات",
-    height=100,
-    key="mandatory_terms_ta",
-))
+    # اتصال LLM
+    try:
+        article_text = call_llm(msgs, model=model_name)
+        logger.info("restoguide | - | app | places.accepted")
+    except Exception as e:
+        log_exception(e)
+        st.exception(e)
+        st.stop()
 
-# =============== تبويبات ===============
-tab_places, tab_article, tab_qc = st.tabs(["🛰️ أماكن", "✍️ مقال", "🧪 جودة"])
+    # محاولة تفسير المخرجات كـ JSON أو نص
+    parsed, plain = normalize_json_or_text(article_text)
+    final_text = ""
+    meta: Dict[str, Any] = {
+        "topic": topic,
+        "area": area,
+        "tone": tone,
+        "length": length,
+        "notes": notes,
+        "sources_count": len(sources),
+        "model": model_name,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
-# ---------- تبويب الأماكن ----------
-with tab_places:
-    st.subheader("🛰️ جلب وتنقية أماكن (بديل مبسّط)")
-    col1, col2, col3, col4 = st.columns([2, 1.2, 1, 1])
-    with col1:
-        gp_keyword = st.text_input("الكلمة المفتاحية", "مطاعم برجر في الرياض", key="gp_kw_in")
-    with col2:
-        gp_city = st.text_input("المدينة", "الرياض", key="gp_city_in")
-    with col3:
-        gp_min_reviews = st.number_input("حد أدنى للمراجعات", min_value=0, max_value=5000, value=50, step=10, key="gp_min_reviews_num")
-    with col4:
-        btn_fetch = st.button("📥 جلب النتائج", key="btn_gp_fetch")
+    if isinstance(parsed, dict) and parsed.get("article"):
+        final_text = str(parsed.get("article"))
+        meta["structure"] = "json"
+        meta["raw"] = parsed
+    else:
+        final_text = plain or article_text
+        meta["structure"] = "text"
 
-    if btn_fetch:
-        rows = search_places(keyword=gp_keyword, city=gp_city, min_reviews=int(gp_min_reviews))
-        for r in rows:
-            r["score"] = _score_place(r, gp_keyword)
-            r["hours_thursday"] = _extract_thursday_hours(r)
-        rows.sort(key=lambda x: x["score"], reverse=True)
-        if len(rows) < 6:
-            st.warning("⚠️ القائمة أقل من 6 عناصر — قد تكون ضعيفة للنشر.")
-        st.dataframe(rows, width=TABLE_WIDTH)
-        st.session_state["places_results"] = rows
+    # تحليل منافسين (اختياري)
+    if do_comp and sources:
+        comp = analyze_competitors([s.get("text", "") for s in sources])
+        meta["competitor_analysis"] = comp
+        meta["content_gaps"] = extract_gap(comp)
 
-    st.markdown("---")
-    if st.button("✔️ اعتماد القائمة", key="btn_accept_places"):
-        rows = st.session_state.get("places_results") or []
-        if not rows:
-            st.warning("لا توجد نتائج لاعتمادها.")
-        else:
-            snap = []
-            for r in rows:
-                snap.append({
-                    "name": r.get("name"), "address": r.get("address"),
-                    "phone": r.get("phone"), "website": r.get("website"),
-                    "google_url": r.get("google_url") or r.get("gmaps_url"),
-                    "rating": r.get("rating"), "reviews_count": r.get("reviews_count"),
-                    "price_band": r.get("price_band"), "open_now": r.get("open_now"),
-                    "hours_thursday": r.get("hours_thursday") or _extract_thursday_hours(r),
-                })
-            refs = _build_references(snap)
-            st.session_state["places_snapshot"] = snap
-            st.session_state["places_references"] = refs
-            st.success("تم الاعتماد.")
+    # تقرير جودة (اختياري)
+    if do_quality:
+        meta["quality_report"] = quality_report(final_text)
 
-# ---------- تبويب المقال ----------
-with tab_article:
-    st.subheader("✍️ توليد المقال")
-    colA, colB = st.columns([2, 1])
-    with colA:
-        article_title = st.text_input("عنوان المقال", "أفضل مطاعم برجر في الرياض", key="article_title_in")
-        article_keyword = st.text_input("الكلمة المفتاحية (اختياري)", "مطاعم برجر في الرياض", key="article_kw_in_tab2")
-        criteria_block = st.text_area("معايير الاختيار", value=GENERAL_CRITERIA, height=120, key="criteria_ta")
-        manual_notes = st.text_area("ملاحظات يدوية (اختياري)", height=120, key="notes_ta")
-    with colB:
-        include_jsonld = st.checkbox("تضمين JSON-LD", value=True, key="include_jsonld_chk")
-        st.caption("تأكد من إضافة مفتاح OpenAI في secrets أو env.")
+    # عرض النتائج
+    st.subheader("✍️ المقال الناتج")
+    st.text_area("النص النهائي", value=final_text, height=400, key="final_article", label_visibility="collapsed")
 
-    snap = st.session_state.get("places_snapshot") or []
-    refs = st.session_state.get("places_references") or []
-    st.write(f"عدد العناصر المعتمدة: **{len(snap)}**")
-    if snap:
-        names_preview = ", ".join([s["name"] for s in snap[:8]]) + ("…" if len(snap) > 8 else "")
-        st.info(f"أبرز الأماكن: {names_preview}")
+    # تنزيل
+    st.subheader("⬇️ تنزيلات")
+    downloads = export_outputs(final_text, meta)
+    if not downloads:
+        st.info("لم يتم تفعيل أي خيار تنزيل.")
+    else:
+        for kind, path in downloads:
+            st.markdown(f"- **{kind}**: [تحميل الملف]({path})")
 
-    if st.button("🚀 توليد المقال", key="btn_generate_article"):
-        if not _has_api_key():
-            st.error("لا يوجد OPENAI_API_KEY."); st.stop()
-        if not snap:
-            st.warning("لا توجد قائمة أماكن معتمدة."); st.stop()
-
-        tone_selection_line = "اعتمدنا على معلومات موثوقة ومراجعات حتى {last_updated}.".format(
-            last_updated=datetime.now().strftime("%B %Y")
-        )
-        facts_lines = []
-        for idx, s in enumerate(snap, start=1):
-            facts_lines.append(
-                f"- {s['name']} — سعر: {s.get('price_band','—')} — ساعات الخميس: {s.get('hours_thursday','—')} — هاتف: {s.get('phone','—')} [^{idx}]"
-            )
-        facts_block = "\n".join(facts_lines)
-        refs_block = "\n".join([f"[^{i+1}]: {r}" for i, r in enumerate(refs)])
-
-        mandatory_hint = ""
-        if mandatory_terms:
-            mandatory_hint = "أدرج العبارات التالية بشكل طبيعي: " + ", ".join(f"“{t}”" for t in mandatory_terms) + "."
-
-        base_prompt = BASE_TMPL.format(
-            title=article_title,
-            keyword=article_keyword,
-            tone_label=st.session_state["tone_select"],
-            tone_selection_line=tone_selection_line,
-            criteria_block=_format_criteria_md(criteria_block),
-            methodology_block=("سياسة تحريرية مختصرة." if include_methodology else "—"),
-            protip_hint=mandatory_hint or "—",
-        )
-
-        system_tone = f"اكتب بالعربية الفصحى، أسلوب {st.session_state['tone_select']}, طول تقريبي {approx_len} كلمة."
-        messages = [
-            {"role": "system", "content": system_tone},
-            {"role": "user", "content":
-                base_prompt
-                + "\n\n---\n\n"
-                + "## حقائق مضغوطة عن الأماكن (للاستشهاد بإحالات [^n]):\n"
-                + facts_block
-                + "\n\n## المراجع (ضع [^n] عند الاستشهاد):\n"
-                + refs_block
-            },
-        ]
-        try:
-            article_md = chat_complete_cached(messages, model=primary_model, max_tokens=2200, temperature=0.7)
-        except Exception as e:
-            st.error(f"فشل توليد المقال: {e}"); st.stop()
-
-        # طبقة Polish + دمج الملاحظات
-        if manual_notes.strip():
-            try:
-                article_md = chat_complete_cached(
-                    [
-                        {"role":"system","content":"أنت محرر عربي محترف، تحافظ على الحقائق وتقلل الحشو."},
-                        {"role":"user","content": POLISH_TMPL.format(article=article_md, user_notes=manual_notes)}
-                    ],
-                    model=primary_model, max_tokens=2200, temperature=0.6
-                )
-            except Exception as e:
-                st.warning(f"تعذّرت طبقة التحرير: {e}")
-
-        # إدراج العبارات الإلزامية إذا غابت
-        missing_terms = [t for t in mandatory_terms if t not in article_md]
-        if missing_terms:
-            try:
-                article_md = chat_complete_cached(
-                    [
-                        {"role":"system","content":"أنت محرر عربي تُدرج عبارات محددة بشكل طبيعي بدون حشو."},
-                        {"role":"user","content": f"أدرج العبارات التالية فقط حيث تلائم السياق: {', '.join(missing_terms)}.\n\nالنص:\n{article_md}"}
-                    ],
-                    model=primary_model, max_tokens=2000, temperature=0.4
-                )
-            except Exception:
-                pass
-
-        # SEO Title/Desc
-        try:
-            meta_out = chat_complete_cached(
-                [
-                    {"role":"system","content":"مختص SEO عربي."},
-                    {"role":"user","content": f"صِغ عنوان SEO (≤60) ووصف ميتا (≤155) لمقال بعنوان \"{article_title}\".\nTITLE: ...\nDESCRIPTION: ..."}
-                ],
-                model=primary_model, max_tokens=180, temperature=0.5
-            )
-        except Exception:
-            meta_out = f"TITLE: {article_title}\nDESCRIPTION: دليل عملي عن {article_keyword}."
-
-        st.subheader("📄 المقال")
-        st.markdown(article_md)
-        st.session_state['last_article_md'] = article_md
-
-        if include_faq:
-            st.markdown(FAQ_TMPL)
-
-        st.subheader("🔎 Meta (SEO)")
-        st.code(meta_out, language="text")
-
-        # تنزيلات
-        from docx import Document
-        def to_docx(md_text: str) -> bytes:
-            doc = Document()
-            for line in md_text.splitlines():
-                doc.add_paragraph(line)
-            import io
-            buf = io.BytesIO()
-            doc.save(buf)
-            return buf.getvalue()
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button('💾 تنزيل Markdown', data=article_md, file_name='article.md', mime='text/markdown', key="dl_md_btn")
-        with col2:
-            st.download_button('📝 تنزيل DOCX', data=to_docx(article_md),
-                               file_name='article.docx',
-                               mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                               key="dl_docx_btn")
-
-# ---------- تبويب الجودة ----------
-with tab_qc:
-    st.subheader("🧪 فحص سريع")
-    qc_text = st.text_area("الصق نص المقال هنا", st.session_state.get("last_article_md",""), height=260, key="qc_text_ta")
-    if st.button("تحليل", key="btn_qc_analyze"):
-        if not qc_text.strip():
-            st.warning("الصق النص أولًا.")
-        else:
-            # فحص مبسّط: كثافة الحشو + تنوع أطوال الجمل
-            filler = ["بشكل كبير","حقًا","للغاية","نوعًا ما","تمامًا","جدًا جدًا"]
-            words = qc_text.split()
-            fluff_hits = sum(qc_text.count(f) for f in filler)
-            avg_len = sum(len(s.split()) for s in qc_text.split(".")) / max(1, len(qc_text.split(".")))
-            res = {
-                "length_words": len(words),
-                "fluff_hits": fluff_hits,
-                "avg_sentence_len": round(avg_len, 2),
-                "hint": "خفّف العبارات العامة وادمج تفاصيل حسية أكثر."
-            }
-            st.json(res)
-            st.success("انتهى التحليل.")
+# ===============
+#  تحسينات بسيطة
+# ===============
+st.markdown("---")
+st.caption("© 2025 RestoGuide — يعمل بواسطة Streamlit و OpenAI. ")
