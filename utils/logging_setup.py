@@ -1,42 +1,36 @@
 # utils/logging_setup.py
-import os, uuid, logging
-from contextlib import contextmanager
-from pythonjsonlogger import jsonlogger
+import logging
+from typing import Optional
 
-_CORR_ID: str | None = None
+_CORR_ID = "-"
 
-def init_logging(app_name: str = "app", level: str = "INFO"):
-    os.makedirs("logs", exist_ok=True)
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+class _CIDFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = _CORR_ID
+        record.app = "restoguide"
+        return True
 
-    fmt = jsonlogger.JsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+_logger: Optional[logging.Logger] = None
 
-    fh = logging.FileHandler("logs/app.jsonl", encoding="utf-8")
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
+def init_logging(app_name: str = "restoguide", level: str = "INFO"):
+    global _logger
+    _logger = logging.getLogger(app_name)
+    if not _logger.handlers:
+        h = logging.StreamHandler()
+        fmt = "%(asctime)s | %(levelname)-7s | %(app)s | %(correlation_id)s | %(name)s | %(message)s"
+        h.setFormatter(logging.Formatter(fmt))
+        h.addFilter(_CIDFilter())
+        _logger.addHandler(h)
+    _logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 def get_logger(name: str = "app") -> logging.Logger:
+    if _logger is None:
+        init_logging()
     return logging.getLogger(name)
 
-def set_correlation_id(value: str | None = None) -> str:
+def set_correlation_id(cid: str):
     global _CORR_ID
-    _CORR_ID = value or uuid.uuid4().hex[:8]
-    return _CORR_ID
+    _CORR_ID = cid
 
-@contextmanager
-def with_context(**extra):
-    logger = get_logger("app")
-    try:
-        logger.info("ctx.enter", extra=extra)
-        yield
-    finally:
-        logger.info("ctx.exit", extra=extra)
-
-def log_exception(logger: logging.Logger, event: str):
-    logger.exception(event)
+def log_exception(e: Exception):
+    get_logger("app").exception(e)
