@@ -132,3 +132,9 @@ def fetch_and_extract(url: str) -> dict:
         "word_count": len(text.split()),
         "metadata": {k:v for k,v in meta.items() if k not in ["headings"]},
     }
+    # utils/content_fetch.py
+try:
+    from content_fetch import *  # يعيد تصدير دوالك الأصلية
+except Exception as _e:
+    raise ImportError("لم يتم العثور على content_fetch.py في الجذر") from _e
+
