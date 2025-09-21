@@ -1,74 +1,47 @@
-# utils/keywords.py
+from typing import List, Dict, Any
 import re
-import unicodedata
-from typing import List, Tuple, Dict
+from collections import Counter
+from .openai_client import chat_complete_cached
 
-AR_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
+STOP = set(["في","من","على","عن","إلى","الى","و","أو","هذا","هذه","ذلك","تلك","كما","مع","حتى","ثم","قد","هو","هي","هم","هن","أن","إن","كان","كانت","ما","لا","لم","لن","إذا","اذا","بعد","قبل","بين","أكثر","أفضل","أفضل","مطاعم","مطعم"])
 
-def strip_diacritics(s: str) -> str:
-    # إزالة التشكيل والمدود فقط، مع الإبقاء على الحروف كما هي
-    s = unicodedata.normalize("NFKD", s)
-    s = AR_DIACRITICS.sub("", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
+def _simple_candidates(text: str) -> List[str]:
+    words = [w for w in re.findall(r"[أ-يA-Za-z0-9\-]+", text or "") if w not in STOP and len(w) > 2]
+    cnt = Counter(words)
+    return [w for w,_ in cnt.most_common(50)]
 
-def parse_required_keywords(spec: str) -> List[Tuple[str, int]]:
-    """
-    تنسيق كل سطر:  كلمة | min=2
-    أمثلة:
-      مطاعم عائلية
-      برجر | min=2
-      جلسات خارجية | min=3
-    """
-    out: List[Tuple[str, int]] = []
-    for line in (spec or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        kw = line
-        m = re.search(r"\|\s*min\s*=\s*(\d+)", line, flags=re.I)
-        min_count = 1
-        if m:
-            min_count = max(1, int(m.group(1)))
-            kw = line[: m.start()].strip()
-        if kw:
-            out.append((kw, min_count))
-    return out
+def related_keywords(topic: str, target_kw: str, texts: List[str], model: str, temperature: float, max_tokens: int, llm_cacher=None) -> List[str]:
+    seed = []
+    for t in texts:
+        seed += _simple_candidates(t)
+    seed = list(dict.fromkeys(seed))[:50]
 
-def count_occurrences(text: str, phrase: str) -> int:
-    """
-    عدّ ظهور عبارة داخل النص بشكل حساس للمسافات ولكن غير حساس للتشكيل.
-    نستخدم مطابقة تقريبية عبر إزالة التشكيل من الطرفين.
-    """
-    if not text or not phrase:
-        return 0
-    t = strip_diacritics(text)
-    p = strip_diacritics(phrase)
-    # مطابقة "عبارة" وليس كلمة مفردة فقط؛ نسمح بمسافات متعددة
-    # نهرب الأحرف الخاصة في العبارة
-    p_escaped = re.escape(p)
-    # لا نستعمل حدود \b لأنها لا تعمل جيدًا مع العربية؛ نستخدم بحثًا مباشرًا
-    return len(re.findall(p_escaped, t, flags=re.IGNORECASE))
+    user = f"""
+أعطني قائمة كلمات/عبارات مرتبطة دلاليًا بموضوع "{topic}" والكلمة المستهدفة "{target_kw}" (عربية غالبًا).
+- استخدم أقصى 25 كلمة/عبارة.
+- لا تكرر كلمات عامة بلا قيمة.
+- إن كانت هناك تسميات أماكن/أحياء/أطباق مشهورة، أدرج بعضها.
+بذور محتملة إن أفادت:
+{", ".join(seed)}
+""".strip()
 
-def enforce_report(text: str, required: List[Tuple[str, int]]) -> Dict:
-    report = {"items": [], "missing": [], "ok": True}
-    for kw, need in required:
-        have = count_occurrences(text or "", kw)
-        item = {"keyword": kw, "min": need, "found": have, "ok": have >= need}
-        report["items"].append(item)
-        if not item["ok"]:
-            report["missing"].append({"keyword": kw, "need": need - have})
-    report["ok"] = len(report["missing"]) == 0
-    return report
-
-FIX_PROMPT = """أدخل الكلمات/العبارات الآتية داخل النص بشكل طبيعي وغير متكلف، و"بدون" حشو أو تكرار زائد،
-واحرص على الحفاظ على المعنى والأسلوب دون تغيير الحقائق. لا تغيّر العناوين أو البُنى الكبيرة،
-واستخدم كل عبارة بالعدد الأدنى المطلوب أو أكثر قليلًا إن لزم، لكن تجنّب التكديس.
-
-النص الأصلي:
-{orig}
-
-الكلمات المطلوبة وعدد النواقص:
-{needs}
-
-أعد النص كاملاً بعد إدماج الكلمات المطلوبة بشكل متناغم، ولا تشرح.
-"""
+    messages = [
+        {"role":"system","content":"خبير SEO عربي يقترح كلمات مرتبطة ذات منفعة بحثية."},
+        {"role":"user","content": user}
+    ]
+    key = None
+    if llm_cacher:
+        key = "rkws:" + str(hash(user))
+        cached = llm_cacher.get(key)
+        if cached:
+            return cached
+    out = chat_complete_cached(messages, model=model, temperature=temperature, max_tokens=max_tokens)
+    kws = []
+    for line in out.splitlines():
+        s = re.sub(r"^[\-\*\d\.\)\s]+","", line).strip()
+        if s and len(s) <= 40:
+            kws.append(s)
+    kws = list(dict.fromkeys(kws))[:25]
+    if llm_cacher and key:
+        llm_cacher.set(key, kws)
+    return kws
