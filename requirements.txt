@@ -10,3 +10,4 @@ lxml>=4.9.3
 extruct>=0.16.0
 w3lib>=2.1.2
 requests-cache>=1.2.0
+diskcache>=5.6.3
