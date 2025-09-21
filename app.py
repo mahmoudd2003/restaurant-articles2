@@ -324,7 +324,7 @@ with tab_article:
             if isinstance(raw, str):
                 s = raw.strip()
                 import json as _json
-                if s.startswith(("[","{"])):
+                if s.startswith(("[", "{")):
                     try: raw = _json.loads(s)
                     except Exception:
                         lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
