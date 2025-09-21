@@ -1,4 +1,5 @@
-from utils.openai_client import chat_complete
+# utils/llm_reviewer.py
+from utils.openai_client import chat_complete_cached
 
 REVIEW_PROMPT = """أنت محرر جودة عربي. شخّص النص التالي بحثًا عن:
 - عبارات قالبية/حشو.
@@ -31,17 +32,29 @@ FIX_PROMPT = """أعد كتابة المقاطع المعلّمة فقط بأس�
 أعد النص الكامل بعد التحسين، لا تشرح.
 """
 
-def llm_review(client, model, fallback_model, text: str):
+def llm_review(client, model, fallback_model, text: str, cacher=None):
     msgs = [
         {"role": "system", "content": "أنت محرر جودة عربي، خبير E-E-A-T."},
         {"role": "user", "content": REVIEW_PROMPT + "\n\n" + text[:8000]},
     ]
-    return chat_complete(client, msgs, model=model, fallback_model=fallback_model, temperature=0.4, max_tokens=1800)
+    return chat_complete_cached(
+        client, msgs,
+        model=model, fallback_model=fallback_model,
+        temperature=0.4, max_tokens=1800,
+        cacher=cacher,
+        cache_extra={"task":"qc_review"}
+    )
 
-def llm_fix(client, model, fallback_model, text: str, flagged_lines: list):
+def llm_fix(client, model, fallback_model, text: str, flagged_lines: list, cacher=None):
     block = "\n".join([f"<<<{ln}>>>" for ln in flagged_lines if ln.strip()])[:6000]
     msgs = [
         {"role": "system", "content": "أنت محرر عربي يعيد صياغة المقاطع المحددة فقط بدقة."},
         {"role": "user", "content": FIX_PROMPT.format(orig=text[:8000], flag_block=block)},
     ]
-    return chat_complete(client, msgs, model=model, fallback_model=fallback_model, temperature=0.5, max_tokens=2400)
+    return chat_complete_cached(
+        client, msgs,
+        model=model, fallback_model=fallback_model,
+        temperature=0.5, max_tokens=2400,
+        cacher=cacher,
+        cache_extra={"task":"qc_fix"}
+    )
