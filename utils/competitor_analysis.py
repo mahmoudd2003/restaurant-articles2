@@ -1,4 +1,5 @@
-from utils.openai_client import chat_complete
+# utils/competitor_analysis.py
+from utils.openai_client import chat_complete_cached
 
 ANALYSIS_PROMPT = """أنت محرّر SEO وناقد طعام صارم.
 حلّل صفحتين تتصدّران نتائج Google لاستعلام: "{query}"
@@ -55,12 +56,18 @@ def build_prompt(page_a: dict, page_b: dict, query: str, place_scope: str, tone_
         query=query, place_scope=place_scope, tone_label=tone_label, reviews_weight=reviews_weight, title_a=ta, title_b=tb
     ) + f"\n\n\n[مقتطفات الصفحة A]\n{snippet_a}\n\n[مقتطفات الصفحة B]\n{snippet_b}\n"
 
-def analyze_competitors(client, model, fallback_model, page_a, page_b, query, place_scope, tone_label, reviews_weight=60):
+def analyze_competitors(client, model, fallback_model, page_a, page_b, query, place_scope, tone_label, reviews_weight=60, cacher=None):
     msgs = [
         {"role": "system", "content": "أنت محرر عربي خبير SEO وE-E-A-T، تحلل المحتوى فقط دون ذكر سلطة النطاق أو الروابط."},
         {"role": "user", "content": build_prompt(page_a, page_b, query, place_scope, tone_label, reviews_weight)},
     ]
-    return chat_complete(client, msgs, model=model, fallback_model=fallback_model, temperature=0.4, max_tokens=2200)
+    return chat_complete_cached(
+        client, msgs,
+        model=model, fallback_model=fallback_model,
+        temperature=0.4, max_tokens=2200,
+        cacher=cacher,
+        cache_extra={"task":"competitor_analysis","query":query,"scope":place_scope}
+    )
 
 def extract_gap_points(analysis_md: str) -> str:
     import re
