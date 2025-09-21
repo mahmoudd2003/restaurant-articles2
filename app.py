@@ -1,18 +1,32 @@
-# ضمان مجلد التخزين
+# app.py — نسخة كاملة محدثة
+# ===============================================================
+# ملاحظات:
+# - يتضمن: كاش HTTP + كاش LLM + كلمات إلزامية + FAQ مدعوم بالمراجع + JSON-LD
+# - تأكد من وجود مجلد prompts وملفاته: base.md, polish.md, faq.md, methodology.md, criteria_*.md
+# - تأكد من وجود data/criteria_catalog.yaml إن كنت تستخدم get_category_criteria
+# ===============================================================
+
 import os
-os.makedirs("data", exist_ok=True)
-
-from utils.content_fetch import fetch_and_extract, configure_http_cache, clear_http_cache
-try:
-    from category_criteria import get_category_criteria
-except ImportError:
-    from modules.category_criteria import get_category_criteria
-
-import io, csv, unicodedata, json
+import io
+import csv
+import json
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+
+# تأكد من وجود مجلد البيانات
+os.makedirs("data", exist_ok=True)
+
+# --- استيرادات داخلية ---
+from utils.content_fetch import fetch_and_extract, configure_http_cache, clear_http_cache
+try:
+    # حسب مكان الملف عندك
+    from category_criteria import get_category_criteria
+except ImportError:
+    # في حال نقلته داخل مجلد modules
+    from modules.category_criteria import get_category_criteria
 
 from utils.openai_client import get_client, chat_complete_cached
 from utils.exporters import to_docx, to_json
@@ -21,32 +35,18 @@ from utils.quality_checks import quality_report
 from utils.llm_reviewer import llm_review, llm_fix
 from utils.llm_cache import LLMCacher
 from utils.keywords import parse_required_keywords, enforce_report, FIX_PROMPT
+from utils.references import normalize_refs, build_references_md, build_citation_map
 
-# --- rerun آمن ---
+# --- إعداد الصفحة ---
+st.set_page_config(page_title="مولد مقالات المطاعم (E-E-A-T)", page_icon="🍽️", layout="wide")
+st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Human Touch + منافسين + كلمات إلزامية + مراجع + QC")
+
+# --- أدوات مساعدة ---
 def safe_rerun():
     if getattr(st, "rerun", None):
-        st.rerun()
+        st.rerun()  # Streamlit >= 1.30
     else:
         st.experimental_rerun()
-
-st.set_page_config(page_title="مولد مقالات المطاعم (E-E-A-T)", page_icon="🍽️", layout="wide")
-st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Human Touch + منافسين + كلمات إلزامية + فحص بشرية")
-
-PROMPTS_DIR = Path("prompts")
-def read_prompt(name: str) -> str:
-    return (PROMPTS_DIR / name).read_text(encoding="utf-8")
-
-BASE_TMPL = read_prompt("base.md")
-POLISH_TMPL = read_prompt("polish.md")
-FAQ_TMPL = read_prompt("faq.md")
-METH_TMPL = read_prompt("methodology.md")
-CRITERIA_MAP = {
-    "بيتزا": read_prompt("criteria_pizza.md"),
-    "مندي": read_prompt("criteria_mandy.md"),
-    "برجر": read_prompt("criteria_burger.md"),
-    "كافيهات": read_prompt("criteria_cafes.md"),
-}
-GENERAL_CRITERIA = read_prompt("criteria_general.md")
 
 def _has_api_key() -> bool:
     try:
@@ -62,6 +62,24 @@ def slugify(name: str) -> str:
     s = _re.sub(r'\W+', '_', s).strip('_').lower()
     return s or "custom"
 
+PROMPTS_DIR = Path("prompts")
+def read_prompt(name: str) -> str:
+    return (PROMPTS_DIR / name).read_text(encoding="utf-8")
+
+# --- تحميل القوالب ---
+BASE_TMPL = read_prompt("base.md")
+POLISH_TMPL = read_prompt("polish.md")
+FAQ_TMPL = read_prompt("faq.md")
+METH_TMPL = read_prompt("methodology.md")
+CRITERIA_MAP = {
+    "بيتزا": read_prompt("criteria_pizza.md"),
+    "مندي": read_prompt("criteria_mandy.md"),
+    "برجر": read_prompt("criteria_burger.md"),
+    "كافيهات": read_prompt("criteria_cafes.md"),
+}
+GENERAL_CRITERIA = read_prompt("criteria_general.md")
+
+# --- نصائح المكان ---
 PLACE_TEMPLATES = {
     "مول/مجمع": "احجز قبل الذروة بـ20–30 دقيقة، راقب أوقات العروض/النافورة، وتجنّب طوابير المصاعد.",
     "جهة من المدينة (شمال/شرق..)": "الوصول أسهل عبر الطرق الدائرية قبل 7:30م، مواقف الشوارع قد تمتلئ مبكرًا في الويكند.",
@@ -73,6 +91,7 @@ PLACE_TEMPLATES = {
 }
 def build_protip_hint(place_type: str) -> str:
     return PLACE_TEMPLATES.get(place_type or "", "قدّم نصيحة عملية مرتبطة بالمكان والذروة وسهولة الوصول.")
+
 def build_place_context(place_type: str, place_name: str, place_rules: str, strict: bool) -> str:
     scope = "صارم (التزم داخل النطاق فقط)" if strict else "مرن (الأولوية داخل النطاق)"
     return f"""سياق المكان:
@@ -81,7 +100,7 @@ def build_place_context(place_type: str, place_name: str, place_rules: str, stri
 - قواعد النطاق: {place_rules or "—"}
 - صرامة الالتزام بالنطاق: {scope}"""
 
-# Sidebar
+# ========================= Sidebar =========================
 st.sidebar.header("⚙️ الإعدادات العامة")
 tone = st.sidebar.selectbox(
     "نغمة الأسلوب",
@@ -94,18 +113,19 @@ include_methodology = st.sidebar.checkbox("إضافة منهجية التحري�
 add_human_touch = st.sidebar.checkbox("تفعيل طبقة اللمسات البشرية (Polish)", value=True)
 approx_len = st.sidebar.slider("الطول التقريبي (كلمات)", 600, 1800, 1100, step=100)
 
-# —— الكلمات الإلزامية —— #
+review_weight = None
+if tone in ["ناقد صارم | مراجعات الجمهور", "ناقد صارم | تجربة مباشرة + مراجعات"]:
+    default_weight = 85 if tone == "ناقد صارم | مراجعات الجمهور" else 55
+    review_weight = st.sidebar.slider("وزن الاعتماد على المراجعات (٪)", 0, 100, default_weight, step=5)
+
+# الكلمات الإلزامية
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧩 كلمات مرتبطة إلزامية")
 kw_help = "اكتب كل كلمة/عبارة بسطر مستقل. لإجبار تكرارها ضع | min=2 مثل: جلسات خارجية | min=2"
 required_kw_spec = st.sidebar.text_area("أدخل الكلمات الإلزامية", value="مطاعم عائلية\nجلسات خارجية | min=2", height=120, help=kw_help)
 required_list = parse_required_keywords(required_kw_spec)
 
-review_weight = None
-if tone in ["ناقد صارم | مراجعات الجمهور", "ناقد صارم | تجربة مباشرة + مراجعات"]:
-    default_weight = 85 if tone == "ناقد صارم | مراجعات الجمهور" else 55
-    review_weight = st.sidebar.slider("وزن الاعتماد على المراجعات (٪)", 0, 100, default_weight, step=5)
-
+# روابط داخلية
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔗 روابط داخلية (اختياري)")
 internal_catalog = st.sidebar.text_area(
@@ -113,10 +133,23 @@ internal_catalog = st.sidebar.text_area(
     "أفضل مطاعم الرياض\nأفضل مطاعم إفطار في الرياض\nأفضل مطاعم بيتزا في جدة"
 )
 
-# —— كاش HTTP —— #
+# المراجع الخارجية + المؤلف/المراجع
+st.sidebar.markdown("---")
+st.sidebar.subheader("📚 المراجع الخارجية")
+refs_text = st.sidebar.text_area(
+    "روابط مصادر موثوقة (سطر لكل رابط)",
+    value="https://goo.gl/maps/\nhttps://www.timeoutdubai.com/\nhttps://www.michelin.com/",
+    height=120,
+    help="أدخل روابط صفحات/تقارير/أدلة موثوقة للاستشهاد بها."
+)
+author_name = st.sidebar.text_input("اسم المؤلف/المحرر", value="فريق التحرير")
+reviewer_name = st.sidebar.text_input("اسم المراجِع (اختياري)", value="")
+last_verified = st.sidebar.text_input("تاريخ آخر تحقق (YYYY-MM-DD)", value=datetime.now().strftime("%Y-%m-%d"))
+
+# كاش HTTP
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 الكاش (جلب الروابط)")
-use_cache = st.sidebar.checkbox("تفعيل كاش HTTP", value=True)
+use_cache = st.sidebar.checkbox("تفعيل كاش HTTP", value=True, help="يُسرّع جلب الصفحات ويقلّل الطلبات الخارجية.")
 cache_hours = st.sidebar.slider("مدة كاش HTTP (ساعات)", 1, 72, 24)
 if st.sidebar.button("🧹 مسح كاش HTTP"):
     ok = clear_http_cache()
@@ -126,10 +159,10 @@ try:
 except Exception as e:
     st.sidebar.warning(f"تعذّر تهيئة كاش HTTP: {e}")
 
-# —— كاش LLM —— #
+# كاش LLM
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 كاش الـLLM")
-llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش مخرجات LLM", value=True)
+llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش مخرجات LLM", value=True, help="يقلل الوقت والتكلفة أثناء التطوير.")
 llm_cache_hours = st.sidebar.slider("مدة كاش LLM (ساعات)", 1, 72, 24)
 if "llm_cacher" not in st.session_state:
     st.session_state["llm_cacher"] = LLMCacher(ttl_hours=llm_cache_hours, enabled=llm_cache_enabled)
@@ -139,7 +172,7 @@ if st.sidebar.button("🧹 مسح كاش LLM"):
     ok = st.session_state["llm_cacher"].clear()
     st.sidebar.success("تم مسح كاش LLM." if ok else "لا توجد بيانات كاش.")
 
-# Tabs
+# ========================= Tabs =========================
 tab_article, tab_comp, tab_qc = st.tabs(["✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى"])
 
 # ------------------ Tab 1: Article Generation ------------------
@@ -149,8 +182,10 @@ with tab_article:
         article_title = st.text_input("عنوان المقال", "أفضل مطاعم في الرياض")
         keyword = st.text_input("الكلمة المفتاحية (اختياري)", "مطاعم في الرياض")
 
-        COUNTRIES = {"السعودية": ["الرياض","جدة","مكة","المدينة المنورة","الدمام","الخبر","الظهران","الطائف","أبها","خميس مشيط","جازان","نجران","تبوك","بريدة","عنيزة","الهفوف","الأحساء","الجبيل","القطيف","ينبع","حائل"],
-                     "الإمارات": ["دبي","أبوظبي","الشارقة","عجمان","رأس الخيمة","الفجيرة","أم القيوين","العين"]}
+        COUNTRIES = {
+            "السعودية": ["الرياض","جدة","مكة","المدينة المنورة","الدمام","الخبر","الظهران","الطائف","أبها","خميس مشيط","جازان","نجران","تبوك","بريدة","عنيزة","الهفوف","الأحساء","الجبيل","القطيف","ينبع","حائل"],
+            "الإمارات": ["دبي","أبوظبي","الشارقة","عجمان","رأس الخيمة","الفجيرة","أم القيوين","العين"]
+        }
         country = st.selectbox("الدولة", ["السعودية", "الإمارات", "أخرى…"], index=0)
         if country in COUNTRIES:
             city_choice = st.selectbox("المدينة", COUNTRIES[country] + ["مدينة مخصّصة…"], index=0)
@@ -205,7 +240,7 @@ with tab_article:
             if raw is None: return []
             if isinstance(raw, str):
                 s = raw.strip()
-                import json as _json, re as _re
+                import json as _json
                 if s.startswith(("[","{"])):
                     try: raw = _json.loads(s)
                     except Exception:
@@ -305,6 +340,7 @@ with tab_article:
             st.stop()
         client = get_client()
 
+        # إعداد النبرة
         if tone == "ناقد صارم | مراجعات الجمهور":
             tone_instructions = ("اكتب كنّاقد صارم يعتمد أساسًا على مراجعات العملاء المنشورة علنًا. "
                                  "ركّز على الأنماط المتكررة واذكر حدود المنهجية. لا تدّعِ زيارة شخصية. لا تستخدم أرقام.")
@@ -320,6 +356,7 @@ with tab_article:
             tone_selection_line = "اعتمدنا على التجربة المباشرة ومعلومات موثوقة متاحة، مع مراجعة دورية."
             system_tone = tone
 
+        # نطاق المحتوى
         if content_scope == "فئة محددة داخل المكان":
             scope_instructions = "التزم بالفئة المحددة فقط داخل النطاق الجغرافي."
         elif content_scope == "هجين (تقسيم داخلي)":
@@ -330,28 +367,67 @@ with tab_article:
         protip_hint = build_protip_hint(place_type)
         place_context = build_place_context(place_type, place_name, place_rules, strict_in_scope)
 
-        faq_block = FAQ_TMPL.format(category=category, city=place_name or city_input) if include_faq else "—"
+        # FAQ مدعوم بالمصادر (اختياري)
+        if include_faq:
+            faq_prompt = (
+                "اكتب 5–8 أسئلة شائعة وإجابات قصيرة بالعربية.\n"
+                "إذا احتجت الاستشهاد بمصدر، استخدم حاشية [^n] برقم مرجعي من قسم \"المراجع\" أدناه.\n"
+                f"المدينة/المكان: {place_name or city_input}\n"
+                f"الفئة: {category}\n"
+                "موضوعات مقترحة: الحجز/الذروة/الجلسات الخارجية/العائلات/اللباس/المواقف/طرق الدفع.\n"
+                "لا تختلق مصادر. إن كانت المعلومة من خبرة تحريرية، اذكر (خبرة تحريرية) بدل الحاشية.\n"
+                "(قائمة المراجع ستظهر بعد المقال؛ رقّم الحواشي فقط دون إعادة الروابط.)"
+            )
+            faq_messages = [
+                {"role": "system", "content": "أنت محرر عربي محترف يكتب FAQ موجزًا ومدعومًا بالمراجع دون اختلاق."},
+                {"role": "user", "content": faq_prompt}
+            ]
+            try:
+                faq_block = chat_complete_cached(
+                    client, faq_messages,
+                    model=primary_model, fallback_model=fallback_model,
+                    temperature=0.4, max_tokens=700,
+                    cacher=st.session_state["llm_cacher"],
+                    cache_extra={"task":"faq_sources","city":place_name or city_input}
+                )
+            except Exception:
+                faq_block = FAQ_TMPL.format(category=category, city=place_name or city_input)
+        else:
+            faq_block = "—"
+
+        # منهجية
         last_updated = datetime.now().strftime("%B %Y")
         methodology_block = METH_TMPL.format(last_updated=last_updated) if include_methodology else "—"
 
-        # كتلة الكلمات الإلزامية للحقن في البرومبت
-        if required_list:
-            req_md = "\n".join([f"- **{kw}** — حد أدنى: {need} مرّة" for kw, need in required_list])
-        else:
-            req_md = "—"
+        # كتلة الكلمات الإلزامية داخل البرومبت
+        req_md = "\n".join([f"- **{kw}** — حد أدنى: {need} مرّة" for kw, need in required_list]) if required_list else "—"
 
+        # المراجع
+        ref_urls = normalize_refs(refs_text)
+        references_block = build_references_md(ref_urls) if ref_urls else "—"
+        citation_map = build_citation_map(ref_urls)
+
+        # بناء البرومبت الأساسي
         base_prompt = BASE_TMPL.format(
             title=article_title, keyword=keyword, content_scope=content_scope, category=category,
             restaurants_list=", ".join(restaurants), criteria_block=criteria_block, faq_block=faq_block,
             methodology_block=methodology_block, tone_label=tone, place_context=place_context,
             protip_hint=protip_hint, scope_instructions=scope_instructions, tone_instructions=tone_instructions,
             tone_selection_line=tone_selection_line.replace("{last_updated}", last_updated),
-            required_keywords_block=req_md, approx_len=approx_len
+            required_keywords_block=req_md, approx_len=approx_len,
+            references_block=references_block
         )
         base_messages = [
-            {"role": "system", "content": f"اكتب المقال بالعربية الفصحى. {system_tone}. طول تقريبي {approx_len} كلمة. أدخِل الكلمات الإلزامية دون حشو."},
+            {"role": "system",
+             "content": (
+                 f"اكتب بالعربية الفصحى. {system_tone}. طول تقريبي {approx_len} كلمة."
+                 " التزم بالنطاق ولا تختلق حقائق أو مصادر. إن لم تكن متأكدًا من معلومة خارجية، لا تذكرها."
+                 " عند الاستشهاد بمصدر خارجي استخدم حاشية [^n] فقط، دون توليد روابط داخل المتن."
+             )},
             {"role": "user", "content": base_prompt},
         ]
+
+        # توليد المقال
         try:
             article_md = chat_complete_cached(
                 client, base_messages,
@@ -364,6 +440,7 @@ with tab_article:
             st.error(f"فشل التوليد: {e}")
             st.stop()
 
+        # طبقة اللمسات البشرية (اختياري)
         apply_polish = add_human_touch or any(checks.values())
         merged_user_notes = (st.session_state.get("comp_gap_notes","") + "\n" + (manual_notes or "")).strip()
         if apply_polish or merged_user_notes:
@@ -383,13 +460,12 @@ with tab_article:
             except Exception as e:
                 st.warning(f"طبقة اللمسات البشرية تعذّرت: {e}")
 
-        # ——— فحص الكلمات الإلزامية بعد التوليد ———
+        # فحص الكلمات الإلزامية + إصلاح تلقائي عند الحاجة
         kw_report = enforce_report(article_md, required_list)
         st.subheader("🧩 التزام الكلمات الإلزامية")
         if not required_list:
             st.caption("لم تُحدّد كلمات إلزامية.")
         else:
-            # عرض جدول بسيط
             rows = []
             for item in kw_report["items"]:
                 status = "✅" if item["ok"] else "❌"
@@ -411,7 +487,6 @@ with tab_article:
                             cacher=st.session_state["llm_cacher"],
                             cache_extra={"task":"kw_fix", "needs": kw_report["missing"]}
                         )
-                        # إعادة فحص سريع
                         kw_report = enforce_report(article_md, required_list)
                         st.success("تم إدماج الكلمات المطلوبة.")
                         st.markdown("\n".join(
@@ -421,7 +496,7 @@ with tab_article:
                     except Exception as e:
                         st.warning(f"تعذّر الإدماج التلقائي: {e}")
 
-        # ——— بقية التدفق (Meta/روابط/عرض/تصدير) ———
+        # Meta
         meta_prompt = f"صِغ عنوان SEO (≤ 60) ووصف ميتا (≤ 155) بالعربية لمقال بعنوان \"{article_title}\". الكلمة المفتاحية: {keyword}.\nTITLE: ...\nDESCRIPTION: ..."
         try:
             meta_out = chat_complete_cached(
@@ -435,8 +510,14 @@ with tab_article:
         except Exception:
             meta_out = f"TITLE: {article_title}\nDESCRIPTION: دليل عملي عن {keyword}."
 
+        # روابط داخلية مقترحة
         links_catalog = [s.strip() for s in internal_catalog.splitlines() if s.strip()]
-        links_prompt = f"اقترح 3 روابط داخلية مناسبة من هذه القائمة إن أمكن:\n{links_catalog}\nالعنوان: {article_title}\nالنطاق: {content_scope}\nالفئة: {category}\nالمدينة/المكان: {place_name or city_input}\nمقتطف:\n{article_md[:800]}\n- رابط داخلي مقترح: <النص>\n- رابط داخلي مقترح: <النص>\n- رابط داخلي مقترح: <النص>"
+        links_prompt = (
+            f"اقترح 3 روابط داخلية مناسبة من هذه القائمة إن أمكن:\n{links_catalog}\n"
+            f"العنوان: {article_title}\nالنطاق: {content_scope}\nالفئة: {category}\n"
+            f"المدينة/المكان: {place_name or city_input}\nمقتطف:\n{article_md[:800]}\n"
+            "- رابط داخلي مقترح: <النص>\n- رابط داخلي مقترح: <النص>\n- رابط داخلي مقترح: <النص>"
+        )
         try:
             links_out = chat_complete_cached(
                 client,
@@ -449,6 +530,7 @@ with tab_article:
         except Exception:
             links_out = "- رابط داخلي مقترح: أفضل مطاعم الرياض\n- رابط داخلي مقترح: دليل مطاعم العائلات في الرياض\n- رابط داخلي مقترح: مقارنة بين الأنماط"
 
+        # عرض المقال والنواتج
         st.subheader("📄 المقال الناتج")
         st.markdown(article_md)
         st.session_state['last_article_md'] = article_md
@@ -456,12 +538,66 @@ with tab_article:
         st.subheader("🔎 Meta (SEO)"); st.code(meta_out, language="text")
         st.subheader("🔗 روابط داخلية مقترحة"); st.markdown(links_out)
 
+        # ===== JSON-LD (Article + FAQPage) =====
+        jsonld = {
+            "@context": "https://schema.org",
+            "@graph": [
+                {
+                    "@type": "Article",
+                    "headline": article_title,
+                    "inLanguage": "ar",
+                    "keywords": [keyword] if keyword else [],
+                    "genre": ["دليل مطاعم", "مراجعات"],
+                    "articleBody": article_md[:5000],
+                    "datePublished": datetime.now().strftime("%Y-%m-%d"),
+                    "dateModified": datetime.now().strftime("%Y-%m-%d"),
+                    "author": {"@type": "Person", "name": author_name} if author_name else {"@type":"Organization","name":"فريق التحرير"},
+                    **({"reviewedBy": {"@type": "Person", "name": reviewer_name}} if reviewer_name else {}),
+                    "isAccessibleForFree": True,
+                    "mainEntityOfPage": {"@type": "WebPage", "name": article_title},
+                    "citation": list(citation_map.values()),  # روابط المراجع
+                }
+            ]
+        }
+
+        # محاولة استخراج Q/A للـFAQPage (بسيطة وغير مثالية)
+        faq_pairs = []
+        try:
+            import re as _re
+            # أنماط شائعة: "- **سؤال**\nجواب"
+            blocks = _re.findall(r"-\s*\*\*(.+?)\*\*\s*\n([^\n].*?)(?=\n- \*\*|\Z)", faq_block, flags=_re.DOTALL)
+            for q, a in blocks:
+                q = q.strip()
+                a = a.strip()
+                if q and a:
+                    faq_pairs.append({"question": q, "answer": a})
+        except Exception:
+            pass
+
+        if faq_pairs:
+            jsonld["@graph"].append({
+                "@type": "FAQPage",
+                "inLanguage": "ar",
+                "mainEntity": [
+                    {"@type": "Question", "name": qa["question"], "acceptedAnswer": {"@type":"Answer","text": qa["answer"]}}
+                    for qa in faq_pairs[:12]
+                ]
+            })
+
+        jsonld_str = json.dumps(jsonld, ensure_ascii=False, indent=2)
+        st.subheader("🧾 JSON-LD")
+        st.code(jsonld_str, language="json")
+        st.download_button("⬇️ تنزيل JSON-LD", data=jsonld_str, file_name=f"{slugify(article_title)}.json", mime="application/ld+json")
+
+        # حفظ JSON تلخيصي
         json_obj = {"title": article_title, "keyword": keyword, "category": category,
-            "country": country, "city": city_input, "place": {"type": place_type, "name": place_name, "rules": place_rules, "strict": strict_in_scope},
+            "country": country, "city": city_input,
+            "place": {"type": place_type, "name": place_name, "rules": place_rules, "strict": strict_in_scope},
             "content_scope": content_scope, "restaurants": restaurants, "last_updated": datetime.now().strftime("%B %Y"),
             "tone": tone, "reviews_weight": review_weight, "models": {"primary": primary_model, "fallback": fallback_model},
             "include_faq": include_faq, "include_methodology": include_methodology,
-            "article_markdown": article_md, "meta": meta_out, "internal_links": links_out}
+            "article_markdown": article_md, "meta": meta_out, "internal_links": links_out,
+            "references": list(citation_map.values()), "author": author_name, "reviewer": reviewer_name, "last_verified": last_verified}
         st.session_state['last_json'] = to_json(json_obj)
 
     with col2:
@@ -475,8 +611,6 @@ with tab_article:
         with colC:
             json_data = st.session_state.get('last_json', '{}')
             st.download_button('🧩 تنزيل JSON', data=json_data, file_name='article.json', mime='application/json')
-
-# ------------------ Tab 2 & 3 تبقى كما في نسختك المحدثة السابقة ------------------
 
 # ------------------ Tab 2: Competitor Analysis ------------------
 with tab_comp:
@@ -559,31 +693,66 @@ with tab_qc:
         else:
             rep = quality_report(qc_text)
             st.session_state["qc_report"] = rep
+
+            # بطاقة درجات مُوسّعة
             st.markdown("### بطاقة الدرجات")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.metric("Human-style", rep["human_style_score"])
+            with c2: st.metric("Sensory %", rep["sensory_ratio"])
+            with c3: st.metric("TTR", rep["ttr"])
+            with c4: st.metric("Passive %", rep["passive_ratio"])
+
+            st.markdown("#### بنية النص")
             colA, colB, colC = st.columns(3)
-            with colA: st.metric("Human-style Score", rep["human_style_score"])
-            with colB: st.metric("Sensory Ratio", rep["sensory_ratio"])
-            with colC: st.metric("Fluff Density", rep["fluff_density"])
-            st.markdown("#### تنوّع الجمل"); st.json(rep["sentence_variety"])
-            if do_eeat:
-                st.markdown("#### E-E-A-T"); st.json({"presence": rep["eeat"], "score": rep["eeat_score"]})
-                st.markdown("#### Information Gain"); st.json({"score": rep["info_gain_score"]})
+            with colA:
+                st.write(f"- كلمات: **{rep['word_count']}**")
+                st.write(f"- جُمل: **{rep['sentence_count']}**")
+                st.write(f"- فقرات: **{rep['paragraph_count']}**")
+            with colB:
+                st.write(f"- متوسط طول الجملة: **{rep['avg_sentence_length']}**")
+                st.write(f"- متوسط طول الفقرة: **{rep['paragraph_metrics']['avg_len']}** ± {rep['paragraph_metrics']['std_len']}")
+            with colC:
+                st.write(f"- فقرات قصيرة(<20): **{rep['paragraph_metrics']['pct_short_lt20w']}%**")
+                st.write(f"- فقرات طويلة(>100): **{rep['paragraph_metrics']['pct_long_gt100w']}%**")
+
+            st.markdown("#### تنوّع بدايات الجمل")
+            st.json({"top_starts": rep["sentence_variety"]["start_top"], "start_hhi": rep["sentence_variety"]["start_hhi"]})
+
+            st.markdown("#### E-E-A-T & Information Gain")
+            m1, m2, m3 = st.columns(3)
+            with m1: st.metric("E-E-A-T", rep["eeat_score"])
+            with m2: st.metric("Info Gain", rep["info_gain_score"])
+            with m3: st.metric("Fluff Density", rep["fluff_density"])
+            st.json(rep["eeat"])
+
             if do_fluff:
+                st.markdown("#### تكرار العبارات (N-grams)")
+                reps = rep.get("repeated_phrases") or []
+                if reps:
+                    for g, c in reps:
+                        st.write(f"- `{g}` × {c}")
+                else:
+                    st.caption("لا يوجد تكرار مزعج ملحوظ.")
+
                 st.markdown("#### عبارات قالبية مرصودة")
                 boiler = rep.get("boilerplate_flags") or []
                 if boiler:
                     for f in boiler:
-                        pattern = f.get("pattern", "?")
-                        excerpt = f.get("excerpt", "")
-                        st.write(f"- **نمط:** `{pattern}` — مقتطف: …{excerpt}…")
+                        st.write(f"- **نمط:** `{f['pattern']}` — …{f['excerpt']}…")
                 else:
                     st.caption("لا توجد عبارات قالبية ظاهرة.")
 
-                repeats = rep.get("repeated_phrases") or []
-                if repeats:
-                    st.markdown("#### عبارات متكررة بشكل زائد")
-                    for g, c in repeats:
-                        st.write(f"- `{g}` × {c}")
+            st.markdown("#### الميل العاطفي")
+            st.json(rep["sentiment"])
+
+            if do_eeat:
+                st.markdown("#### عناوين وأقسام")
+                st.json(rep["headings"])
+
+            st.markdown("#### توصيات ذكية")
+            for tip in rep["tips"]:
+                st.write(f"- {tip}")
+
             st.success("انتهى التحليل السريع.")
             st.session_state["qc_text"] = qc_text
 
