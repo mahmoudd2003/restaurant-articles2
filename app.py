@@ -1,32 +1,39 @@
-# app.py — النسخة الكاملة (Logs مُحسّنة + Google Places + توليد + QC + منافسين + WordPress)
-# ==========================================================================================
+# app.py — النسخة الكاملة المبسَّطة مع إصلاحات الـIDs والـLogs والـLLM Cache
+# =============================================================================
 # المتطلبات (في .streamlit/secrets.toml):
 #   OPENAI_API_KEY, GOOGLE_API_KEY, WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD
-# الموديولات المطلوبة في utils/:
-#   content_fetch.py, openai_client.py, exporters.py, competitor_analysis.py, quality_checks.py,
-#   llm_reviewer.py, llm_cache.py, keywords.py, references.py, places_provider.py, wp_client.py, logging_setup.py
-# ==========================================================================================
+# مجلد utils/ يجب أن يحتوي:
+#   content_fetch.py, openai_client.py, exporters.py, competitor_analysis.py,
+#   quality_checks.py, llm_reviewer.py, llm_cache.py, keywords.py,
+#   references.py, places_provider.py, wp_client.py, logging_setup.py
+# مجلد prompts/ يجب أن يحتوي:
+#   base.md, polish.md, faq.md, methodology.md, criteria_*.md, criteria_general.md
+# =============================================================================
 
+from __future__ import annotations
 import os, io, re, csv, json, unicodedata
 from datetime import datetime
 from pathlib import Path
+
 import streamlit as st
 
 # إعداد مجلد بيانات
 os.makedirs("data", exist_ok=True)
 
-# --- اللوجينغ ---
+# ---------- اللوجينغ ----------
 from utils.logging_setup import (
-    init_logging, get_logger, set_correlation_id, with_context, log_exception, set_level, tail
+    init_logging, get_logger, set_correlation_id,
+    with_context, log_exception, set_level, tail
 )
 init_logging(app_name="restoguide", level=os.getenv("LOG_LEVEL", "INFO"))
 logger = get_logger("app")
 
-# --- استيرادات داخلية ---
+# ---------- استيرادات داخلية ----------
 from utils.content_fetch import fetch_and_extract, configure_http_cache, clear_http_cache
 try:
     from category_criteria import get_category_criteria
 except ImportError:
+    # لو عندك الملف داخل مجلد آخر
     from modules.category_criteria import get_category_criteria
 
 from utils.openai_client import get_client, chat_complete_cached
@@ -40,7 +47,7 @@ from utils.references import normalize_refs, build_references_md, build_citation
 from utils.places_provider import get_places_dataset, references_from_places, facts_markdown
 from utils.wp_client import WPClient
 
-# --- صفحة ---
+# ---------- إعداد صفحة ----------
 st.set_page_config(page_title="مولد مقالات المطاعم", page_icon="🍽️", layout="wide")
 st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Google Places + مراجع + WordPress + Logs")
 
@@ -81,7 +88,7 @@ PROMPTS_DIR = Path("prompts")
 def read_prompt(name: str) -> str:
     return (PROMPTS_DIR / name).read_text(encoding="utf-8")
 
-# --- القوالب ---
+# ---------- القوالب ----------
 BASE_TMPL = read_prompt("base.md")
 POLISH_TMPL = read_prompt("polish.md")
 FAQ_TMPL = read_prompt("faq.md")
@@ -94,7 +101,7 @@ CRITERIA_MAP = {
 }
 GENERAL_CRITERIA = read_prompt("criteria_general.md")
 
-# --- نصائح مكان ---
+# ---------- نصائح مكان ----------
 PLACE_TEMPLATES = {
     "مول/مجمع": "احجز قبل الذروة بـ20–30 دقيقة، راقب أوقات العروض/النافورة، وتجنّب طوابير المصاعد.",
     "جهة من المدينة (شمال/شرق..)": "الوصول أسهل عبر الطرق الدائرية قبل 7:30م، ومواقف الشوارع تمتلئ مبكرًا بالويكند.",
@@ -106,6 +113,7 @@ PLACE_TEMPLATES = {
 }
 def build_protip_hint(place_type: str) -> str:
     return PLACE_TEMPLATES.get(place_type or "", "قدّم نصيحة عملية مرتبطة بالمكان والذروة وسهولة الوصول.")
+
 def build_place_context(place_type: str, place_name: str, place_rules: str, strict: bool) -> str:
     scope = "صارم (التزم داخل النطاق فقط)" if strict else "مرن (الأولوية داخل النطاق)"
     return f"""سياق المكان:
@@ -124,18 +132,18 @@ fallback_model = st.sidebar.selectbox("موديل بديل", ["gpt-4o","gpt-4o-m
 include_faq = st.sidebar.checkbox("إضافة FAQ", value=True)
 include_methodology = st.sidebar.checkbox("إضافة منهجية التحرير", value=True)
 add_human_touch = st.sidebar.checkbox("تفعيل Polish", value=True)
-approx_len = st.sidebar.slider("الطول التقريبي (كلمات)", 600, 1800, 1100, step=100)
+approx_len = st.sidebar.slider("الطول التقريبي (كلمات)", 600, 1800, 1100, step=100, key="approx_len_slider")
 
 review_weight = None
 if tone in ["ناقد صارم | مراجعات الجمهور","ناقد صارم | تجربة مباشرة + مراجعات"]:
     default_weight = 85 if tone == "ناقد صارم | مراجعات الجمهور" else 55
-    review_weight = st.sidebar.slider("وزن الاعتماد على المراجعات (٪)", 0, 100, default_weight, step=5)
+    review_weight = st.sidebar.slider("وزن الاعتماد على المراجعات (٪)", 0, 100, default_weight, step=5, key="review_weight_slider")
 
 # كلمات إلزامية
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧩 كلمات إلزامية")
 kw_help = "سطر لكل كلمة/عبارة. لإجبار تكرارها: | min=2 مثل: جلسات خارجية | min=2"
-required_kw_spec = st.sidebar.text_area("الكلمات", "مطاعم عائلية\nجلسات خارجية | min=2", height=110, help=kw_help)
+required_kw_spec = st.sidebar.text_area("الكلمات", "مطاعم عائلية\nجلسات خارجية | min=2", height=110, help=kw_help, key="required_kw_text")
 required_list = parse_required_keywords(required_kw_spec)
 
 # روابط داخلية
@@ -143,7 +151,8 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🔗 روابط داخلية")
 internal_catalog = st.sidebar.text_area(
     "عناوين/سلاگز (سطر لكل عنصر)",
-    "أفضل مطاعم الرياض\nأفضل مطاعم إفطار في الرياض\nأفضل مطاعم بيتزا في جدة"
+    "أفضل مطاعم الرياض\nأفضل مطاعم إفطار في الرياض\nأفضل مطاعم بيتزا في جدة",
+    key="internal_catalog_text"
 )
 
 # مراجع + معلومات E-E-A-T
@@ -152,18 +161,19 @@ st.sidebar.subheader("📚 المراجع الخارجية")
 refs_text = st.sidebar.text_area(
     "روابط (سطر لكل رابط)",
     "https://goo.gl/maps/\nhttps://www.timeoutdubai.com/\nhttps://www.michelin.com/",
-    height=110
+    height=110,
+    key="external_refs_text"
 )
-author_name = st.sidebar.text_input("اسم المؤلف", value="فريق التحرير")
-reviewer_name = st.sidebar.text_input("اسم المراجع (اختياري)", value="")
-last_verified = st.sidebar.text_input("آخر تحقق (YYYY-MM-DD)", value=datetime.now().strftime("%Y-%m-%d"))
+author_name = st.sidebar.text_input("اسم المؤلف", value="فريق التحرير", key="author_name")
+reviewer_name = st.sidebar.text_input("اسم المراجع (اختياري)", value="", key="reviewer_name")
+last_verified = st.sidebar.text_input("آخر تحقق (YYYY-MM-DD)", value=datetime.now().strftime("%Y-%m-%d"), key="last_verified_date")
 
 # كاش HTTP
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 كاش HTTP (جلب صفحات)")
-use_cache = st.sidebar.checkbox("تفعيل", value=True)
-cache_hours = st.sidebar.slider("مدة (ساعات)", 1, 72, 24)
-if st.sidebar.button("🧹 مسح كاش HTTP"):
+use_cache = st.sidebar.checkbox("تفعيل", value=True, key="http_cache_enabled")
+cache_hours = st.sidebar.slider("مدة (ساعات)", 1, 72, 24, key="http_cache_hours")
+if st.sidebar.button("🧹 مسح كاش HTTP", key="clear_http_cache_btn"):
     ok = clear_http_cache()
     st.sidebar.success("تم المسح." if ok else "لا توجد بيانات كاش.")
 try:
@@ -174,20 +184,20 @@ except Exception as e:
 # كاش LLM
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 كاش LLM")
-llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش LLM", value=True)
-llm_cache_hours = st.sidebar.slider("مدة (ساعات)", 1, 72, 24)
+llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش LLM", value=True, key="llm_cache_enabled")
+llm_cache_hours = st.sidebar.slider("مدة (ساعات)", 1, 72, 24, key="llm_cache_hours")
 if "llm_cacher" not in st.session_state:
     st.session_state["llm_cacher"] = LLMCacher(ttl_hours=llm_cache_hours, enabled=llm_cache_enabled)
 else:
     st.session_state["llm_cacher"].configure(enabled=llm_cache_enabled, ttl_hours=llm_cache_hours)
-if st.sidebar.button("🧹 مسح كاش LLM"):
+if st.sidebar.button("🧹 مسح كاش LLM", key="clear_llm_cache_btn"):
     ok = st.session_state["llm_cacher"].clear()
     st.sidebar.success("تم المسح." if ok else "لا توجد بيانات.")
 
 # Logs
 st.sidebar.markdown("---")
 st.sidebar.subheader("📜 Logs")
-lvl = st.sidebar.selectbox("المستوى", ["DEBUG","INFO","WARNING","ERROR"], index=1)
+lvl = st.sidebar.selectbox("المستوى", ["DEBUG","INFO","WARNING","ERROR"], index=1, key="log_level_select")
 set_level(lvl)
 with st.sidebar.expander("آخر 300 سطر"):
     st.code(tail("logs/app.jsonl", 300), language="json")
@@ -200,17 +210,17 @@ tab_places, tab_article, tab_comp, tab_qc, tab_wp = st.tabs([
 # ------------------ Tab 0: Google Places ------------------
 with tab_places:
     st.subheader("🛰️ جلب & تنقية — Google Places (ساعات الخميس ثابتة)")
-    kw = st.text_input("الكلمة المفتاحية", "مطاعم برجر")
-    city = st.text_input("المدينة", "الرياض")
-    min_reviews = st.slider("حد أدنى للمراجعات", 0, 500, 50, step=10)
-    max_results = st.slider("حد أقصى للنتائج", 10, 100, 40, step=10)
+    kw = st.text_input("الكلمة المفتاحية", "مطاعم برجر", key="places_kw")
+    city = st.text_input("المدينة", "الرياض", key="places_city")
+    min_reviews = st.slider("حد أدنى للمراجعات", 0, 500, 50, step=10, key="places_min_reviews")
+    max_results = st.slider("حد أقصى للنتائج", 10, 100, 40, step=10, key="places_max_results")
     st.caption("نستخرج ساعات **الخميس** فقط لكل مكان (ثابت كما طلبت).")
 
     colp1, colp2 = st.columns([1,1])
     with colp1:
-        do_fetch = st.button("📥 جلب النتائج")
+        do_fetch = st.button("📥 جلب النتائج", key="btn_fetch_places")
     with colp2:
-        do_accept = st.button("✔️ اعتماد القائمة")
+        do_accept = st.button("✔️ اعتماد القائمة", key="btn_accept_places")
 
     if do_fetch:
         if not GOOGLE_API_KEY:
@@ -263,36 +273,36 @@ with tab_places:
 with tab_article:
     col1, col2 = st.columns([2,1])
     with col1:
-        article_title = st.text_input("عنوان المقال", "أفضل مطاعم في الرياض")
-        keyword = st.text_input("الكلمة المفتاحية (اختياري)", "مطاعم في الرياض")
+        article_title = st.text_input("عنوان المقال", "أفضل مطاعم في الرياض", key="article_title")
+        keyword = st.text_input("الكلمة المفتاحية (اختياري)", "مطاعم في الرياض", key="article_kw")
 
         COUNTRIES = {
             "السعودية": ["الرياض","جدة","مكة","المدينة المنورة","الدمام","الخبر","الظهران","الطائف","أبها","خميس مشيط","جازان","نجران","تبوك","بريدة","عنيزة","الهفوف","الأحساء","الجبيل","القطيف","ينبع","حائل"],
             "الإمارات": ["دبي","أبوظبي","الشارقة","عجمان","رأس الخيمة","الفجيرة","أم القيوين","العين"]
         }
-        country = st.selectbox("الدولة", ["السعودية","الإمارات","أخرى…"], index=0)
+        country = st.selectbox("الدولة", ["السعودية","الإمارات","أخرى…"], index=0, key="country_sel")
         if country in COUNTRIES:
-            city_choice = st.selectbox("المدينة", COUNTRIES[country] + ["مدينة مخصّصة…"], index=0)
-            city_input = st.text_input("أدخل اسم المدينة", city_choice) if city_choice == "مدينة مخصّصة…" else city_choice
+            city_choice = st.selectbox("المدينة", COUNTRIES[country] + ["مدينة مخصّصة…"], index=0, key="city_choice_sel")
+            city_input = st.text_input("أدخل اسم المدينة", city_choice, key="city_custom") if city_choice == "مدينة مخصّصة…" else city_choice
         else:
-            country = st.text_input("اسم الدولة", "السعودية")
-            city_input = st.text_input("المدينة", "الرياض")
+            country = st.text_input("اسم الدولة", "السعودية", key="country_text")
+            city_input = st.text_input("المدينة", "الرياض", key="city_text")
 
         place_type = st.selectbox("نوع المكان",
-            ["مول/مجمع","جهة من المدينة (شمال/شرق..)","حيّ محدد","شارع/ممشى","واجهة بحرية/كورنيش","فندق/منتجع","مدينة كاملة"], index=0)
-        place_name = st.text_input("اسم المكان/النطاق", placeholder="مثلًا: دبي مول / شمال الرياض")
-        place_rules = st.text_area("قواعد النطاق (اختياري)", height=70, placeholder="داخل المول فقط، أو أحياء معيّنة…")
-        strict_in_scope = st.checkbox("التزم بالنطاق الجغرافي فقط (صارم)", value=True)
+            ["مول/مجمع","جهة من المدينة (شمال/شرق..)","حيّ محدد","شارع/ممشى","واجهة بحرية/كورنيش","فندق/منتجع","مدينة كاملة"], index=0, key="place_type")
+        place_name = st.text_input("اسم المكان/النطاق", placeholder="مثلًا: دبي مول / شمال الرياض", key="place_name")
+        place_rules = st.text_area("قواعد النطاق (اختياري)", height=70, placeholder="داخل المول فقط، أو أحياء معيّنة…", key="place_rules")
+        strict_in_scope = st.checkbox("التزم بالنطاق الجغرافي فقط (صارم)", value=True, key="strict_in_scope")
 
-        content_scope = st.radio("نطاق المحتوى", ["فئة محددة داخل المكان","شامل بلا فئة","هجين (تقسيم داخلي)"], index=1 if place_type=="مول/مجمع" else 0)
+        content_scope = st.radio("نطاق المحتوى", ["فئة محددة داخل المكان","شامل بلا فئة","هجين (تقسيم داخلي)"], index=1 if place_type=="مول/مجمع" else 0, key="content_scope")
 
         built_in_labels = list(CRITERIA_MAP.keys())
         category = "عام"
         criteria_block = GENERAL_CRITERIA
-
         is_custom_category = False
+
         if content_scope == "فئة محددة داخل المكان":
-            category_choice = st.selectbox("الفئة", built_in_labels + ["فئة مخصّصة…"])
+            category_choice = st.selectbox("الفئة", built_in_labels + ["فئة مخصّصة…"], key="category_choice")
             if category_choice == "فئة مخصّصة…":
                 if "pending_custom_criteria_text" in st.session_state:
                     st.session_state["custom_criteria_text"] = st.session_state.pop("pending_custom_criteria_text")
@@ -318,33 +328,41 @@ with tab_article:
             category = "عام"
             criteria_block = GENERAL_CRITERIA
 
-        # توليد/جلب معايير الفئة
+        # --- وظائف مساعدة لمعايير الفئة ---
         def _normalize_criteria(raw):
-            if raw is None: return []
+            if raw is None:
+                return []
             if isinstance(raw, str):
                 s = raw.strip()
                 import json as _json
                 if s.startswith(("[", "{")):
-                    try: raw = _json.loads(s)
+                    try:
+                        raw = _json.loads(s)
                     except Exception:
                         lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
-                        return [ln for ln in lines if ln and ln.lower()!="undefined"]
+                        return [ln for ln in lines if ln and ln.lower() != "undefined"]
                 else:
                     lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
-                    return [ln for ln in lines if ln and ln.lower()!="undefined"]
+                    return [ln for ln in lines if ln and ln.lower() != "undefined"]
             if isinstance(raw, dict):
-                for k in ("criteria","bullets","items","list"):
-                    if k in raw: raw = raw[k]; break
+                for k in ("criteria", "bullets", "items", "list"):
+                    if k in raw:
+                        raw = raw[k]
+                        break
                 else:
                     vals = list(raw.values())
-                    raw = vals if all(isinstance(v,str) for v in vals) else list(raw.keys())
-            if isinstance(raw, (list,tuple)):
-                out=[]
+                    raw = vals if all(isinstance(v, str) for v in vals) else list(raw.keys())
+            if isinstance(raw, (list, tuple)):
+                out = []
                 for x in raw:
-                    if isinstance(x,str): t=x.strip().strip(",").strip('"').strip("'")
-                    elif isinstance(x,dict) and "text" in x: t=str(x["text"]).strip()
-                    else: t=str(x).strip()
-                    if t and t.lower()!="undefined": out.append(t)
+                    if isinstance(x, str):
+                        t = x.strip().strip(",").strip('"').strip("'")
+                    elif isinstance(x, dict) and "text" in x:
+                        t = str(x["text"]).strip()
+                    else:
+                        t = str(x).strip()
+                    if t and t.lower() != "undefined":
+                        out.append(t)
                 return out
             return [str(raw)]
         def _format_criteria_md(items):
@@ -377,9 +395,9 @@ with tab_article:
         else:
             criteria_block = st.session_state.get("criteria_generated_md_map", {}).get(effective_category, criteria_block)
 
-        restaurants_input = st.text_area("أدخل أسماء المطاعم (سطر لكل مطعم)", "مطعم 1\nمطعم 2\nمطعم 3", height=140)
+        restaurants_input = st.text_area("أدخل أسماء المطاعم (سطر لكل مطعم)", "مطعم 1\nمطعم 2\nمطعم 3", height=140, key="restaurants_text")
         st.markdown("**أو** ارفع CSV بأسماء المطاعم (عمود name)")
-        csv_file = st.file_uploader("رفع CSV (اختياري)", type=["csv"])
+        csv_file = st.file_uploader("رفع CSV (اختياري)", type=["csv"], key="restaurants_csv")
 
         def _normalize_name(s: str) -> str:
             return " ".join((s or "").strip().split())
@@ -405,16 +423,16 @@ with tab_article:
                 st.warning(f"تعذّر قراءة CSV: {e}")
         restaurants = _merge_unique(typed_restaurants, uploaded_restaurants)
 
-        manual_notes = st.text_area("ملاحظات تُدمج داخل التجارب (اختياري)", st.session_state.get("comp_gap_notes",""))
+        manual_notes = st.text_area("ملاحظات تُدمج داخل التجارب (اختياري)", st.session_state.get("comp_gap_notes",""), key="manual_notes")
 
     with col2:
         st.subheader("قائمة تدقيق بشرية")
         checks = {
-            "sensory":  st.checkbox("وصف حسي دقيق (مطعم واحد على الأقل)"),
-            "personal": st.checkbox("ملاحظة شخصية/تفضيل"),
-            "compare":  st.checkbox("مقارنة مع زيارة سابقة/مطعم مشابه"),
-            "critique": st.checkbox("نقد غير متوقّع صغير"),
-            "vary":     st.checkbox("تنوّع أطوال الفقرات"),
+            "sensory":  st.checkbox("وصف حسي دقيق (مطعم واحد على الأقل)", key="check_sensory"),
+            "personal": st.checkbox("ملاحظة شخصية/تفضيل", key="check_personal"),
+            "compare":  st.checkbox("مقارنة مع زيارة سابقة/مطعم مشابه", key="check_compare"),
+            "critique": st.checkbox("نقد غير متوقّع صغير", key="check_critique"),
+            "vary":     st.checkbox("تنوّع أطوال الفقرات", key="check_vary"),
         }
 
     # Snapshot Google Places
@@ -422,7 +440,8 @@ with tab_article:
     use_snapshot = False
     if places_snapshot:
         use_snapshot = st.checkbox("استخدام قائمة Google Places المعتمدة", value=True,
-                                   help="يتم تمرير حقائق مختصرة (تشمل ساعات الخميس) للبرومبت + دمج مراجع Google تلقائيًا.")
+                                   help="يتم تمرير حقائق مختصرة (تشمل ساعات الخميس) للبرومبت + دمج مراجع Google تلقائيًا.",
+                                   key="use_snapshot_checkbox")
     snapshot_refs = st.session_state.get("places_references") or []
     manual_refs = normalize_refs(refs_text)
     combined_refs = []
@@ -434,7 +453,7 @@ with tab_article:
 
     facts_block = facts_markdown(places_snapshot) if (places_snapshot and use_snapshot) else "—"
 
-    if st.button("🚀 توليد المقال"):
+    if st.button("🚀 توليد المقال", key="btn_generate_article"):
         if not _has_api_key():
             st.error("لا يوجد OPENAI_API_KEY.")
             st.stop()
@@ -466,6 +485,8 @@ with tab_article:
         protip_hint = build_protip_hint(place_type)
         place_context = build_place_context(place_type, place_name, place_rules, strict_in_scope)
         last_updated = datetime.now().strftime("%B %Y")
+
+        # FAQ (مدعوم بالمراجع إن أمكن)
         faq_block = "—"
         if include_faq:
             faq_prompt = (
@@ -491,7 +512,7 @@ with tab_article:
                 faq_block = FAQ_TMPL.format(category=category, city=place_name or city_input)
 
         methodology_block = METH_TMPL.format(last_updated=last_updated) if include_methodology else "—"
-        req_md = "\n".join([f"- **{kw}** — حد أدنى: {need} مرّة" for kw, need in required_list]) if required_list else "—"
+        req_md = "\n".join([f"- **{kw_}** — حد أدنى: {need} مرّة" for kw_, need in required_list]) if required_list else "—"
         references_block = references_block_combined
 
         base_prompt = BASE_TMPL.format(
@@ -513,8 +534,8 @@ with tab_article:
                 base_messages = [
                     {"role": "system",
                      "content": (
-                         f"اكتب بالعربية الفصحى. {system_tone}. طول تقريبي {approx_len} كلمة."
-                         " التزم بالنطاق ولا تختلق حقائق أو مصادر. عند الاستشهاد بمصدر خارجي استخدم حاشية [^n] فقط."
+                         f"اكتب بالعربية الفصحى. {system_tone}. طول تقريبي {approx_len} كلمة. "
+                         "التزم بالنطاق ولا تختلق حقائق أو مصادر. عند الاستشهاد بمصدر خارجي استخدم حاشية [^n] فقط."
                      )},
                     {"role": "user", "content": base_prompt},
                 ]
@@ -550,7 +571,7 @@ with tab_article:
             except Exception as e:
                 st.warning(f"طبقة اللمسات البشرية تعذّرت: {e}")
 
-        # التزام الكلمات الإلزامية
+        # --- التزام الكلمات الإلزامية ---
         kw_report = enforce_report(article_md, required_list)
         st.subheader("🧩 التزام الكلمات الإلزامية")
         if not required_list:
@@ -564,7 +585,7 @@ with tab_article:
 
             if not kw_report["ok"]:
                 needs_lines = "\n".join([f"- {m['keyword']}: نحتاج +{m['need']}" for m in kw_report["missing"]])
-                if st.button("✍️ إدماج تلقائي للكلمات الناقصة"):
+                if st.button("✍️ إدماج تلقائي للكلمات الناقصة", key="btn_fix_required"):
                     fix_msgs = [
                         {"role": "system", "content": "أنت محرر عربي دقيق تُدخل كلمات مطلوبة بنعومة وبدون حشو."},
                         {"role": "user", "content": FIX_PROMPT.format(orig=article_md[:12000], needs=needs_lines)}
@@ -586,7 +607,7 @@ with tab_article:
                     except Exception as e:
                         st.warning(f"تعذّر الإدماج: {e}")
 
-        # Meta
+        # --- Meta ---
         meta_prompt = f"صِغ عنوان SEO (≤ 60) ووصف ميتا (≤ 155) بالعربية لمقال بعنوان \"{article_title}\". الكلمة المفتاحية: {keyword}.\nTITLE: ...\nDESCRIPTION: ..."
         try:
             meta_out = chat_complete_cached(
@@ -600,7 +621,7 @@ with tab_article:
         except Exception:
             meta_out = f"TITLE: {article_title}\nDESCRIPTION: دليل عملي عن {keyword}."
 
-        # روابط داخلية
+        # --- روابط داخلية ---
         links_catalog = [s.strip() for s in internal_catalog.splitlines() if s.strip()]
         links_prompt = (
             f"اقترح 3 روابط داخلية مناسبة من هذه القائمة إن أمكن:\n{links_catalog}\n"
@@ -620,7 +641,7 @@ with tab_article:
         except Exception:
             links_out = "- رابط داخلي مقترح: أفضل مطاعم الرياض\n- رابط داخلي مقترح: دليل مطاعم العائلات في الرياض\n- رابط داخلي مقترح: مقارنة بين الأنماط"
 
-        # عرض
+        # --- عرض الناتج ---
         st.subheader("📄 المقال الناتج")
         st.markdown(article_md)
         st.session_state['last_article_md'] = article_md
@@ -629,7 +650,7 @@ with tab_article:
         st.subheader("🔎 Meta (SEO)"); st.code(meta_out, language="text")
         st.subheader("🔗 روابط داخلية"); st.markdown(links_out)
 
-        # JSON-LD
+        # --- JSON-LD ---
         jsonld = {
             "@context": "https://schema.org",
             "@graph": [
@@ -650,7 +671,7 @@ with tab_article:
                 }
             ]
         }
-        # FAQPage إن توفّر
+        # إضافة FAQPage إن أمكن
         faq_pairs = []
         try:
             import re as _re
@@ -694,30 +715,30 @@ with tab_article:
         colA, colB, colC = st.columns(3)
         with colA:
             md_data = st.session_state.get('last_article_md', '')
-            st.download_button('💾 تنزيل Markdown', data=md_data, file_name='article.md', mime='text/markdown')
+            st.download_button('💾 تنزيل Markdown', data=md_data, file_name='article.md', mime='text/markdown', key="dl_md")
         with colB:
             md_data = st.session_state.get('last_article_md', '')
-            st.download_button('📝 تنزيل DOCX', data=to_docx(md_data), file_name='article.docx', mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+            st.download_button('📝 تنزيل DOCX', data=to_docx(md_data), file_name='article.docx', mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document', key="dl_docx")
         with colC:
             json_data = st.session_state.get('last_json', '{}')
-            st.download_button('🧩 تنزيل JSON', data=json_data, file_name='article.json', mime='application/json')
+            st.download_button('🧩 تنزيل JSON', data=json_data, file_name='article.json', mime='application/json', key="dl_json")
 
 # ------------------ Tab 2: Competitor Analysis ------------------
 with tab_comp:
     st.subheader("🆚 تحليل أول منافسين — روابط يدوية")
     st.caption("نحلّل المحتوى من زاوية المحتوى وE-E-A-T فقط.")
-    query = st.text_input("استعلام البحث", "أفضل مطاعم دبي مول")
-    place_scope_desc = st.text_input("وصف النطاق/المكان (اختياري)", "داخل دبي مول فقط")
-    url_a = st.text_input("رابط المنافس A", "")
-    url_b = st.text_input("رابط المنافس B", "")
+    query = st.text_input("استعلام البحث", "أفضل مطاعم دبي مول", key="comp_query")
+    place_scope_desc = st.text_input("وصف النطاق/المكان (اختياري)", "داخل دبي مول فقط", key="comp_scope")
+    url_a = st.text_input("رابط المنافس A", "", key="comp_url_a")
+    url_b = st.text_input("رابط المنافس B", "", key="comp_url_b")
 
     tone_for_analysis = st.selectbox("نبرة التحليل",
-        ["ناقد صارم | مراجعات الجمهور", "ناقد صارم | تجربة مباشرة + مراجعات", "دليل تحريري محايد"], index=0)
-    reviews_weight_analysis = st.slider("وزن الاعتماد على المراجعات (٪)", 0, 100, 60, step=5)
+        ["ناقد صارم | مراجعات الجمهور", "ناقد صارم | تجربة مباشرة + مراجعات", "دليل تحريري محايد"], index=0, key="comp_tone")
+    reviews_weight_analysis = st.slider("وزن الاعتماد على المراجعات (٪)", 0, 100, 60, step=5, key="comp_reviews_w")
 
     colx, coly = st.columns(2)
-    with colx: fetch_btn = st.button("📥 جلب المحتوى")
-    with coly: analyze_btn = st.button("🧠 تنفيذ التحليل")
+    with colx: fetch_btn = st.button("📥 جلب المحتوى", key="btn_comp_fetch")
+    with coly: analyze_btn = st.button("🧠 تنفيذ التحليل", key="btn_comp_analyze")
 
     if fetch_btn:
         if not url_a or not url_b:
@@ -730,8 +751,8 @@ with tab_comp:
                     page_b = fetch_and_extract(url_b)
                 st.session_state["comp_pages"] = {"A": page_a, "B": page_b}
                 st.success("تم الجلب.")
-                st.write("**A:**", page_a.get("title") or url_a, f"({page_a['word_count']} كلمة)")
-                st.write("**B:**", page_b.get("title") or url_b, f"({page_b['word_count']} كلمة)")
+                st.write("**A:**", page_a.get("title") or url_a, f"({page_a.get('word_count',0)} كلمة)")
+                st.write("**B:**", page_b.get("title") or url_b, f"({page_b.get('word_count',0)} كلمة)")
             except Exception as e:
                 st.error(f"تعذّر الجلب: {e}")
 
@@ -766,16 +787,16 @@ with tab_comp:
 # ------------------ Tab 3: QC ------------------
 with tab_qc:
     st.subheader("🧪 فحوص الجودة")
-    qc_text = st.text_area("الصق نص المقال هنا", st.session_state.get("last_article_md",""), height=260)
+    qc_text = st.text_area("الصق نص المقال هنا", st.session_state.get("last_article_md",""), height=260, key="qc_text")
     col_q1, col_q2, col_q3 = st.columns(3)
     with col_q1:
-        do_fluff = st.checkbox("كشف الحشو والعبارات القالبية", value=True)
+        do_fluff = st.checkbox("كشف الحشو والعبارات القالبية", value=True, key="qc_fluff")
     with col_q2:
-        do_eeat = st.checkbox("مؤشرات E-E-A-T", value=True)
+        do_eeat = st.checkbox("مؤشرات E-E-A-T", value=True, key="qc_eeat")
     with col_q3:
-        do_llm_review = st.checkbox("تشخيص مُرشد (LLM)", value=True)
+        do_llm_review = st.checkbox("تشخيص مُرشد (LLM)", value=True, key="qc_llm")
 
-    if st.button("🔎 تحليل سريع"):
+    if st.button("🔎 تحليل سريع", key="btn_qc_run"):
         if not qc_text.strip():
             st.warning("الصق النص أولًا.")
         else:
@@ -783,33 +804,37 @@ with tab_qc:
             st.session_state["qc_report"] = rep
             st.markdown("### بطاقة الدرجات")
             c1, c2, c3, c4 = st.columns(4)
-            with c1: st.metric("Human-style", rep["human_style_score"])
-            with c2: st.metric("Sensory %", rep["sensory_ratio"])
-            with c3: st.metric("TTR", rep["ttr"])
-            with c4: st.metric("Passive %", rep["passive_ratio"])
+            with c1: st.metric("Human-style", rep.get("human_style_score", 0))
+            with c2: st.metric("Sensory %", rep.get("sensory_ratio", 0))
+            with c3: st.metric("TTR", rep.get("ttr", 0))
+            with c4: st.metric("Passive %", rep.get("passive_ratio", 0))
 
             st.markdown("#### بنية النص")
             colA, colB, colC = st.columns(3)
             with colA:
-                st.write(f"- كلمات: **{rep['word_count']}**")
-                st.write(f"- جمل: **{rep['sentence_count']}**")
-                st.write(f"- فقرات: **{rep['paragraph_count']}**")
+                st.write(f"- كلمات: **{rep.get('word_count',0)}**")
+                st.write(f"- جمل: **{rep.get('sentence_count',0)}**")
+                st.write(f"- فقرات: **{rep.get('paragraph_count',0)}**")
             with colB:
-                st.write(f"- متوسط طول الجملة: **{rep['avg_sentence_length']}**")
-                st.write(f"- طول الفقرة: **{rep['paragraph_metrics']['avg_len']}** ± {rep['paragraph_metrics']['std_len']}")
+                st.write(f"- متوسط طول الجملة: **{rep.get('avg_sentence_length',0)}**")
+                pm = rep.get("paragraph_metrics", {})
+                st.write(f"- طول الفقرة: **{pm.get('avg_len',0)}** ± {pm.get('std_len',0)}")
             with colC:
-                st.write(f"- فقرات قصيرة(<20): **{rep['paragraph_metrics']['pct_short_lt20w']}%**")
-                st.write(f"- فقرات طويلة(>100): **{rep['paragraph_metrics']['pct_long_gt100w']}%**")
+                pm = rep.get("paragraph_metrics", {})
+                st.write(f"- فقرات قصيرة(<20): **{pm.get('pct_short_lt20w',0)}%**")
+                st.write(f"- فقرات طويلة(>100): **{pm.get('pct_long_gt100w',0)}%**")
 
             st.markdown("#### تنوّع بدايات الجمل")
-            st.json({"top_starts": rep["sentence_variety"]["start_top"], "start_hhi": rep["sentence_variety"]["start_hhi"]})
+            sv = rep.get("sentence_variety", {})
+            st.json({"top_starts": sv.get("start_top", []), "start_hhi": sv.get("start_hhi", 0)})
 
             st.markdown("#### E-E-A-T & Information Gain")
             m1, m2, m3 = st.columns(3)
-            with m1: st.metric("E-E-A-T", rep["eeat_score"])
-            with m2: st.metric("Info Gain", rep["info_gain_score"])
-            with m3: st.metric("Fluff Density", rep["fluff_density"])
-            st.json(rep["eeat"])
+            with m1: st.metric("E-E-A-T", rep.get("eeat_score", 0))
+            with m2: st.metric("Info Gain", rep.get("info_gain_score", 0))
+            with m3: st.metric("Fluff Density", rep.get("fluff_density", 0))
+            if do_eeat:
+                st.json(rep.get("eeat", {}))
 
             if do_fluff:
                 st.markdown("#### تكرار العبارات (N-grams)")
@@ -818,23 +843,22 @@ with tab_qc:
                     st.write(f"- `{g}` × {c}")
                 st.markdown("#### عبارات قالبية مرصودة")
                 for f in rep.get("boilerplate_flags") or []:
-                    st.write(f"- **نمط:** `{f['pattern']}` — …{f['excerpt']}…")
+                    st.write(f"- **نمط:** `{f.get('pattern','?')}` — …{f.get('excerpt','')}…")
 
             st.markdown("#### الميل العاطفي")
-            st.json(rep["sentiment"])
+            st.json(rep.get("sentiment", {}))
 
-            if do_eeat:
-                st.markdown("#### العناوين والأقسام")
-                st.json(rep["headings"])
+            st.markdown("#### العناوين والأقسام")
+            st.json(rep.get("headings", {}))
 
             st.markdown("#### توصيات ذكية")
-            for tip in rep["tips"]:
+            for tip in rep.get("tips", []):
                 st.write(f"- {tip}")
 
             st.success("انتهى التحليل.")
             st.session_state["qc_text"] = qc_text
 
-    if do_llm_review and st.button("🧠 تشخيص مُرشد (LLM)"):
+    if do_llm_review and st.button("🧠 تشخيص مُرشد (LLM)", key="btn_qc_llm"):
         if not qc_text.strip():
             st.warning("الصق النص أولًا.")
         elif not _has_api_key():
@@ -847,8 +871,8 @@ with tab_qc:
 
     st.markdown("---")
     st.markdown("#### إصلاح ذكي لأجزاء معيّنة")
-    flagged_block = st.text_area("ألصق المقاطع الضعيفة (سطر لكل مقطع)", height=120)
-    if st.button("✍️ إعادة صياغة المقاطع المحددة"):
+    flagged_block = st.text_area("ألصق المقاطع الضعيفة (سطر لكل مقطع)", height=120, key="qc_fix_list")
+    if st.button("✍️ إعادة صياغة المقاطع المحددة", key="btn_qc_fix"):
         if not flagged_block.strip():
             st.warning("أدخل المقاطع أولًا.")
         elif not qc_text.strip():
@@ -872,18 +896,18 @@ with tab_wp:
     if not publishable:
         st.info("لا يوجد محتوى منشأ بعد. أنشئ المقال من تبويب ✍️ أولًا.")
     else:
-        article_title_wp = st.text_input("عنوان ووردبريس", value=st.session_state.get("generated_title") or "مسودة: مقال مطاعم")
-        wp_status = st.selectbox("حالة النشر", ["draft","publish"], index=0)
-        city_cat = st.text_input("تصنيف المدينة (Category)", value=st.session_state.get("city_for_wp") or "الرياض")
-        type_cat = st.text_input("تصنيف الفئة (Category)", value=st.session_state.get("type_for_wp") or "برجر")
-        extra_tags = st.text_input("وسوم (Tags)", value="مطاعم, عائلات, جلسات خارجية")
-        add_jsonld = st.checkbox("إرفاق JSON-LD داخل المحتوى", value=True)
-        add_snapshot_meta = st.checkbox("حفظ places_snapshot كـ meta + تعليق مخفي", value=True)
+        article_title_wp = st.text_input("عنوان ووردبريس", value=st.session_state.get("generated_title") or "مسودة: مقال مطاعم", key="wp_title")
+        wp_status = st.selectbox("حالة النشر", ["draft","publish"], index=0, key="wp_status")
+        city_cat = st.text_input("تصنيف المدينة (Category)", value=st.session_state.get("city_for_wp") or "الرياض", key="wp_city_cat")
+        type_cat = st.text_input("تصنيف الفئة (Category)", value=st.session_state.get("type_for_wp") or "برجر", key="wp_type_cat")
+        extra_tags = st.text_input("وسوم (Tags)", value="مطاعم, عائلات, جلسات خارجية", key="wp_tags")
+        add_jsonld = st.checkbox("إرفاق JSON-LD داخل المحتوى", value=True, key="wp_add_jsonld")
+        add_snapshot_meta = st.checkbox("حفظ places_snapshot كـ meta + تعليق مخفي", value=True, key="wp_add_meta")
 
         st.markdown("#### معاينة مختصرة")
-        st.text_area("نص المقال", value=st.session_state.get("last_article_md","")[:1800], height=160)
+        st.text_area("نص المقال", value=st.session_state.get("last_article_md","")[:1800], height=160, key="wp_preview")
 
-        if st.button("🚀 نشر/تحديث (Upsert)"):
+        if st.button("🚀 نشر/تحديث (Upsert)", key="btn_wp_upsert"):
             if not (WP_BASE_URL and WP_USERNAME and WP_APP_PASSWORD):
                 st.error("إعدادات ووردبريس غير مكتملة في secrets.toml")
                 st.stop()
@@ -930,7 +954,6 @@ with tab_wp:
                             pass
 
                     slug = slugify(article_title_wp)
-                    # excerpt من الميتا السابق أو بداية النص
                     meta_out = st.session_state.get("last_json", "{}")
                     try:
                         meta_obj = json.loads(meta_out)
