@@ -1,3 +1,5 @@
+# utils/content_fetch.py
+import os
 import re
 import requests
 from bs4 import BeautifulSoup
@@ -7,11 +9,75 @@ from trafilatura.settings import use_config
 import extruct
 from w3lib.html import get_base_url
 
+# —— (جديد) كاش على مستوى requests —— #
+try:
+    import requests_cache
+except Exception:
+    requests_cache = None
+
+_CACHE_INSTALLED = False
+
+def configure_http_cache(enabled: bool = True, hours: int = 24, backend: str = "sqlite", name: str = "http_cache"):
+    """
+    تهيئة/تعطيل الكاش لطلبات HTTP عبر requests-cache.
+    - enabled: تفعيل/تعطيل الكاش
+    - hours: مدة الصلاحية
+    - backend: 'sqlite' أو 'filesystem' (اختياري)
+    - name: اسم قاعدة الكاش
+    """
+    global _CACHE_INSTALLED
+    if not requests_cache:
+        return False
+    # أزل أي إعداد سابق
+    if _CACHE_INSTALLED:
+        try:
+            requests_cache.uninstall_cache()
+        except Exception:
+            pass
+        _CACHE_INSTALLED = False
+    if enabled:
+        from datetime import timedelta
+        requests_cache.install_cache(
+            cache_name=name,
+            backend=backend,
+            expire_after=timedelta(hours=max(1, int(hours))),
+            allowable_methods=("GET",),
+            allowable_codes=(200,),
+            stale_if_error=True,
+        )
+        _CACHE_INSTALLED = True
+    return _CACHE_INSTALLED
+
+def clear_http_cache() -> bool:
+    """يمسح محتوى الكاش (إن وُجد)."""
+    if not requests_cache:
+        return False
+    try:
+        requests_cache.clear()
+        return True
+    except Exception:
+        return False
+
+# تهيئة افتراضية قابلة للتحكم عبر المتغيرات البيئية (لو لم تُستدعَ من الواجهة):
+if requests_cache:
+    _default_enabled = os.getenv("HTTP_CACHE_ENABLED", "1") == "1"
+    _default_hours = int(os.getenv("HTTP_CACHE_HOURS", "24"))
+    _default_backend = os.getenv("HTTP_CACHE_BACKEND", "sqlite")
+    _default_name = os.getenv("HTTP_CACHE_NAME", "http_cache")
+    try:
+        configure_http_cache(_default_enabled, _default_hours, _default_backend, _default_name)
+    except Exception:
+        pass
+# —— /انتهى الكاش —— #
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ContentAuditBot/1.0; +https://example.com/bot)"}
 
 def fetch_url(url: str, timeout: int = 15) -> str:
     resp = requests.get(url, headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
+    # تسجيل بسيط يساعدك في تتبع الضربات من الكاش في لوج الخادم
+    if hasattr(resp, "from_cache"):
+        print(f"[http-cache] {'HIT ' if resp.from_cache else 'MISS'} {url}")
     return resp.text
 
 def extract_with_trafilatura(html: str, url: str = None) -> str:
