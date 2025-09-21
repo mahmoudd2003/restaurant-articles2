@@ -82,3 +82,8 @@ def extract_gap_points(analysis_md: str) -> str:
         if line.strip().startswith(("-", "*", "•")):
             lines.append(line.strip("-*• ").strip())
     return "\n".join(lines[:12])
+try:
+    from exporters import *  # يعيد تصدير دوالك الأصلية (to_docx, to_json, ...)
+except Exception as _e:
+    raise ImportError("لم يتم العثور على exporters.py في الجذر") from _e
+
