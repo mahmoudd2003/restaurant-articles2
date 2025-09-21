@@ -1,10 +1,14 @@
-# app.py — نسخة كاملة محدثة
-# ===============================================================
+# app.py — نسخة كاملة محدثة (دمج سطحي نظيف مع Google Places + ثبات ساعات الخميس)
+# ==================================================================================
+# يتضمن:
+# - تبويب 🛰️ Google Places (جلب & تنقية & اعتماد قائمة) — ساعات العمل ثابتة على "الخميس"
+# - تمرير Snapshot المعتمد إلى مولّد المقال ليُستخدم كوقود حقائق + مراجع
+# - كاش HTTP + كاش LLM + كلمات إلزامية + FAQ مدعوم بالمراجع + JSON-LD + منافسين + QC
 # ملاحظات:
-# - يتضمن: كاش HTTP + كاش LLM + كلمات إلزامية + FAQ مدعوم بالمراجع + JSON-LD
-# - تأكد من وجود مجلد prompts وملفاته: base.md, polish.md, faq.md, methodology.md, criteria_*.md
-# - تأكد من وجود data/criteria_catalog.yaml إن كنت تستخدم get_category_criteria
-# ===============================================================
+# - تأكد من وجود الملفات المساندة في utils/: content_fetch, openai_client, exporters, competitor_analysis,
+#   quality_checks, llm_reviewer, llm_cache, keywords, references, places_provider
+# - ضع مفاتيحك في .streamlit/secrets.toml (GOOGLE_API_KEY, OPENAI_API_KEY, ... إلخ)
+# ==================================================================================
 
 import os
 import io
@@ -16,13 +20,13 @@ from pathlib import Path
 
 import streamlit as st
 
-# تأكد من وجود مجلد البيانات
+# --- إعداد مجلد بيانات عام ---
 os.makedirs("data", exist_ok=True)
 
 # --- استيرادات داخلية ---
 from utils.content_fetch import fetch_and_extract, configure_http_cache, clear_http_cache
 try:
-    # حسب مكان الملف عندك
+    # حسب مكان الملف لديك
     from category_criteria import get_category_criteria
 except ImportError:
     # في حال نقلته داخل مجلد modules
@@ -36,10 +40,13 @@ from utils.llm_reviewer import llm_review, llm_fix
 from utils.llm_cache import LLMCacher
 from utils.keywords import parse_required_keywords, enforce_report, FIX_PROMPT
 from utils.references import normalize_refs, build_references_md, build_citation_map
+from utils.places_provider import (
+    get_places_dataset, references_from_places, facts_markdown
+)
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="مولد مقالات المطاعم (E-E-A-T)", page_icon="🍽️", layout="wide")
-st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Human Touch + منافسين + كلمات إلزامية + مراجع + QC")
+st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Google Places + كلمات إلزامية + مراجع + منافسين + QC")
 
 # --- أدوات مساعدة ---
 def safe_rerun():
@@ -61,6 +68,16 @@ def slugify(name: str) -> str:
     import re as _re
     s = _re.sub(r'\W+', '_', s).strip('_').lower()
     return s or "custom"
+
+def get_secret(key, default=""):
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
 
 PROMPTS_DIR = Path("prompts")
 def read_prompt(name: str) -> str:
@@ -91,7 +108,6 @@ PLACE_TEMPLATES = {
 }
 def build_protip_hint(place_type: str) -> str:
     return PLACE_TEMPLATES.get(place_type or "", "قدّم نصيحة عملية مرتبطة بالمكان والذروة وسهولة الوصول.")
-
 def build_place_context(place_type: str, place_name: str, place_rules: str, strict: bool) -> str:
     scope = "صارم (التزم داخل النطاق فقط)" if strict else "مرن (الأولوية داخل النطاق)"
     return f"""سياق المكان:
@@ -146,7 +162,7 @@ author_name = st.sidebar.text_input("اسم المؤلف/المحرر", value="�
 reviewer_name = st.sidebar.text_input("اسم المراجِع (اختياري)", value="")
 last_verified = st.sidebar.text_input("تاريخ آخر تحقق (YYYY-MM-DD)", value=datetime.now().strftime("%Y-%m-%d"))
 
-# كاش HTTP
+# كاش HTTP (لجلب الروابط)
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 الكاش (جلب الروابط)")
 use_cache = st.sidebar.checkbox("تفعيل كاش HTTP", value=True, help="يُسرّع جلب الصفحات ويقلّل الطلبات الخارجية.")
@@ -173,7 +189,67 @@ if st.sidebar.button("🧹 مسح كاش LLM"):
     st.sidebar.success("تم مسح كاش LLM." if ok else "لا توجد بيانات كاش.")
 
 # ========================= Tabs =========================
-tab_article, tab_comp, tab_qc = st.tabs(["✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى"])
+tab_places, tab_article, tab_comp, tab_qc = st.tabs(["🛰️ Google Places", "✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى"])
+
+# ------------------ Tab 0: Google Places (جلب & تنقية) ------------------
+with tab_places:
+    st.subheader("🛰️ جلب & تنقية — Google Places (ساعات الخميس ثابتة)")
+    kw = st.text_input("الكلمة المفتاحية", "مطاعم برجر")
+    city = st.text_input("المدينة", "الرياض")
+    min_reviews = st.slider("الحد الأدنى لعدد المراجعات", 0, 500, 50, step=10, help="فلترة أولية لرفع الجودة")
+    max_results = st.slider("الحد الأقصى للنتائج (قبل التنقية)", 10, 100, 40, step=10)
+    st.caption("سيتم استخراج **ساعات يوم الخميس** تحديدًا لكل مكان، كما طلبت.")
+
+    colp1, colp2 = st.columns([1,1])
+    with colp1:
+        do_fetch = st.button("📥 جلب النتائج")
+    with colp2:
+        do_accept = st.button("✔️ اعتماد القائمة لاستخدامها في المقال")
+
+    if do_fetch:
+        if not GOOGLE_API_KEY:
+            st.error("لا يوجد GOOGLE_API_KEY داخل secrets. أضِفه إلى .streamlit/secrets.toml")
+            st.stop()
+        with st.spinner("يجلب من Google Places..."):
+            try:
+                places = get_places_dataset(GOOGLE_API_KEY, kw, city, min_reviews=min_reviews, max_results=max_results)
+                st.session_state["places_raw"] = places
+            except Exception as e:
+                st.error(f"فشل الجلب: {e}")
+                places = []
+        if places:
+            st.success(f"تم الجلب: {len(places)} عنصرًا بعد التنقية والترتيب.")
+            if len(places) < 6:
+                st.warning("القائمة أقل من 6 عناصر — قد تكون ضعيفة. جرّب خفض حدّ المراجعات أو توسيع الإستعلام.")
+            # عرض جدول مختصر
+            import pandas as pd
+            df = pd.DataFrame([{
+                "name": p["name"],
+                "rating": p.get("rating"),
+                "reviews": p.get("reviews_count"),
+                "price": p.get("price_band"),
+                "الأوقات (الخميس)": p.get("thursday_range"),
+                "phone": p.get("phone"),
+                "website": p.get("website"),
+                "google_url": p.get("google_url"),
+            } for p in places])
+            st.dataframe(df, use_container_width=True)
+            # معاينة حقائق موجزة ستُغذي البرومبت
+            st.markdown("#### حقائق مختصرة (ستُمرَّر للبرومبت — لا تُطبع كما هي):")
+            st.markdown(facts_markdown(places))
+        else:
+            st.info("لا نتائج بعد. أدخل كلمة مفتاحية ومدينة ثم اضغط جلب.")
+
+    if do_accept:
+        snap = st.session_state.get("places_raw") or []
+        if not snap:
+            st.warning("لا توجد قائمة جاهزة — اضغط أولًا (جلب النتائج).")
+        else:
+            st.session_state["places_snapshot"] = snap
+            # نبني مراجع تلقائيًا من الـSnapshot (روابط Google + مواقع رسمية)
+            st.session_state["places_references"] = references_from_places(snap)
+            st.success(f"تم اعتماد {len(snap)} عنصرًا. يمكنك الآن الانتقال لتبويب (توليد المقال).")
+            st.markdown("**تنبيه:** هذه القائمة ستُستخدم كوقود حقائق للمقال، مع ذكر ساعات الخميس فقط.")
 
 # ------------------ Tab 1: Article Generation ------------------
 with tab_article:
@@ -334,6 +410,27 @@ with tab_article:
             "vary": st.checkbox("نوّع أطوال الفقرات لتجنب الرتابة"),
         }
 
+    # ---------- دمج Snapshot من Google Places ----------
+    places_snapshot = st.session_state.get("places_snapshot") or []
+    use_snapshot = False
+    if places_snapshot:
+        use_snapshot = st.checkbox("استخدام قائمة Google Places المعتمدة في هذا المقال", value=True,
+                                   help="سيتم تمرير حقائق مختصرة (تشمل ساعات الخميس) إلى البرومبت + دمج مراجع Google تلقائيًا.")
+
+    # دمج المراجع: مراجع snapshot + المراجع اليدوية
+    snapshot_refs = st.session_state.get("places_references") or []
+    manual_refs = normalize_refs(refs_text)
+    combined_refs = []
+    for u in snapshot_refs + manual_refs:
+        if u and u not in combined_refs:
+            combined_refs.append(u)
+    references_block_combined = build_references_md(combined_refs) if combined_refs else "—"
+    citation_map = build_citation_map(combined_refs)
+
+    # حقائق مختصرة لتمريرها للبرومبت (ساعات الخميس ثابتة)
+    facts_block = facts_markdown(places_snapshot) if (places_snapshot and use_snapshot) else "—"
+
+    # ---------- توليد المقال ----------
     if st.button("🚀 توليد المقال"):
         if not _has_api_key():
             st.error("لا يوجد OPENAI_API_KEY.")
@@ -402,10 +499,8 @@ with tab_article:
         # كتلة الكلمات الإلزامية داخل البرومبت
         req_md = "\n".join([f"- **{kw}** — حد أدنى: {need} مرّة" for kw, need in required_list]) if required_list else "—"
 
-        # المراجع
-        ref_urls = normalize_refs(refs_text)
-        references_block = build_references_md(ref_urls) if ref_urls else "—"
-        citation_map = build_citation_map(ref_urls)
+        # المراجع — دمج snapshot + اليدوي (أُعدّت بالأعلى)
+        references_block = references_block_combined
 
         # بناء البرومبت الأساسي
         base_prompt = BASE_TMPL.format(
@@ -417,6 +512,11 @@ with tab_article:
             required_keywords_block=req_md, approx_len=approx_len,
             references_block=references_block
         )
+        # ألحق حقائق Google المختصرة (ساعات الخميس) كي يسترشد بها الموديل — لا تُطبع كما هي
+        if use_snapshot and places_snapshot:
+            base_prompt += "\n\n## بيانات Google (مختصرة — لا تُطبع كما هي)\n"
+            base_prompt += facts_block
+
         base_messages = [
             {"role": "system",
              "content": (
@@ -434,7 +534,7 @@ with tab_article:
                 max_tokens=2200, temperature=0.7,
                 model=primary_model, fallback_model=fallback_model,
                 cacher=st.session_state["llm_cacher"],
-                cache_extra={"task":"article_base", "required": required_list}
+                cache_extra={"task":"article_base", "required": required_list, "use_snapshot": use_snapshot}
             )
         except Exception as e:
             st.error(f"فشل التوليد: {e}")
@@ -555,20 +655,18 @@ with tab_article:
                     **({"reviewedBy": {"@type": "Person", "name": reviewer_name}} if reviewer_name else {}),
                     "isAccessibleForFree": True,
                     "mainEntityOfPage": {"@type": "WebPage", "name": article_title},
-                    "citation": list(citation_map.values()),  # روابط المراجع
+                    "citation": list(citation_map.values()),  # روابط المراجع (Google + مواقع رسمية + يدوي)
                 }
             ]
         }
 
-        # محاولة استخراج Q/A للـFAQPage (بسيطة وغير مثالية)
+        # محاولة استخراج Q/A للـFAQPage
         faq_pairs = []
         try:
             import re as _re
-            # أنماط شائعة: "- **سؤال**\nجواب"
             blocks = _re.findall(r"-\s*\*\*(.+?)\*\*\s*\n([^\n].*?)(?=\n- \*\*|\Z)", faq_block, flags=_re.DOTALL)
             for q, a in blocks:
-                q = q.strip()
-                a = a.strip()
+                q = q.strip(); a = a.strip()
                 if q and a:
                     faq_pairs.append({"question": q, "answer": a})
         except Exception:
@@ -597,7 +695,9 @@ with tab_article:
             "tone": tone, "reviews_weight": review_weight, "models": {"primary": primary_model, "fallback": fallback_model},
             "include_faq": include_faq, "include_methodology": include_methodology,
             "article_markdown": article_md, "meta": meta_out, "internal_links": links_out,
-            "references": list(citation_map.values()), "author": author_name, "reviewer": reviewer_name, "last_verified": last_verified}
+            "references": list(citation_map.values()), "author": author_name, "reviewer": reviewer_name, "last_verified": last_verified,
+            "places_snapshot": st.session_state.get("places_snapshot", [])  # نحتفظ بالـSnapshot المعتمد
+        }
         st.session_state['last_json'] = to_json(json_obj)
 
     with col2:
