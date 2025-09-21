@@ -1,40 +1,35 @@
-# utils/content_fetch.py
-from typing import Dict, Any, Optional
-import requests
+import requests, time
+import trafilatura
+from typing import List, Dict, Any
+from requests_cache import CachedSession
 
-def configure_http_cache(ttl_hours: int = 24, enabled: bool = True):
-    if not enabled:
-        return
-    try:
-        import requests_cache
-        requests_cache.install_cache("http_cache", expire_after=ttl_hours * 3600)
-    except Exception:
-        pass
+_http = None
 
-def fetch_and_extract(url: str) -> Dict[str, Any]:
-    title = ""
-    text  = ""
-    html  = ""
-    try:
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-        html = resp.text
-        # جرّب trafilatura أولاً
+def configure_http_cache(ttl_hours=24, enabled=True):
+    global _http
+    if enabled:
+        _http = CachedSession(cache_name="data/http_cache", backend="sqlite", expire_after=ttl_hours*3600)
+    else:
+        _http = requests.Session()
+
+def _get(url: str) -> str:
+    global _http
+    if _http is None:
+        _http = requests.Session()
+    r = _http.get(url, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+def fetch_and_extract(urls: List[str]) -> List[Dict[str, Any]]:
+    out = []
+    for url in urls:
         try:
-            from trafilatura import extract  # type: ignore
-            text = extract(html) or ""
+            html = _get(url)
+            downloaded = trafilatura.extract(html, include_comments=False, include_tables=False, url=url)
+            if not downloaded:
+                downloaded = ""
+            title = trafilatura.extract_metadata(html, url=url).title if trafilatura.extract_metadata(html, url=url) else ""
+            out.append({"url": url, "title": title, "text": downloaded})
         except Exception:
-            text = ""
-        # لو فشل، ارجع إلى BeautifulSoup
-        if not text:
-            try:
-                from bs4 import BeautifulSoup  # type: ignore
-                soup = BeautifulSoup(html, "lxml")
-                title_tag = soup.find("title")
-                title = title_tag.get_text(strip=True) if title_tag else ""
-                text = soup.get_text(" ", strip=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return {"url": url, "title": title, "text": text}
+            out.append({"url": url, "title": "", "text": ""})
+    return out
