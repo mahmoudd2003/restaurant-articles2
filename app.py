@@ -15,11 +15,12 @@ from pathlib import Path
 
 import streamlit as st
 
-from utils.openai_client import get_client, chat_complete
+from utils.openai_client import get_client, chat_complete_cached
 from utils.exporters import to_docx, to_json
 from utils.competitor_analysis import analyze_competitors, extract_gap_points
 from utils.quality_checks import quality_report
 from utils.llm_reviewer import llm_review, llm_fix
+from utils.llm_cache import LLMCacher
 
 # --- rerun آمن لنسخ ستريملت المختلفة ---
 def safe_rerun():
@@ -110,16 +111,28 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 الكاش (جلب الروابط)")
 use_cache = st.sidebar.checkbox("تفعيل الكاش", value=True, help="يُسرّع جلب الصفحات ويقلّل الطلبات الخارجية.")
 cache_hours = st.sidebar.slider("مدة الكاش (ساعات)", 1, 72, 24)
-if st.sidebar.button("🧹 مسح الكاش"):
+if st.sidebar.button("🧹 مسح كاش HTTP"):
     ok = clear_http_cache()
-    st.sidebar.success("تم مسح الكاش." if ok else "لم يتم العثور على بيانات كاش.")
+    st.sidebar.success("تم مسح كاش HTTP." if ok else "لم يتم العثور على بيانات كاش.")
 
-# تطبيق إعداد الكاش
 try:
     configure_http_cache(enabled=use_cache, hours=cache_hours)
 except Exception as e:
-    st.sidebar.warning(f"تعذّر تهيئة الكاش: {e}")
-# —— /انتهى —— #
+    st.sidebar.warning(f"تعذّر تهيئة كاش HTTP: {e}")
+
+# —— كاش LLM —— #
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 كاش الـLLM")
+llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش مخرجات LLM", value=True, help="يقلل الوقت والتكلفة أثناء التطوير.")
+llm_cache_hours = st.sidebar.slider("مدة كاش LLM (ساعات)", 1, 72, 24)
+if "llm_cacher" not in st.session_state:
+    st.session_state["llm_cacher"] = LLMCacher(ttl_hours=llm_cache_hours, enabled=llm_cache_enabled)
+else:
+    st.session_state["llm_cacher"].configure(enabled=llm_cache_enabled, ttl_hours=llm_cache_hours)
+
+if st.sidebar.button("🧹 مسح كاش LLM"):
+    ok = st.session_state["llm_cacher"].clear()
+    st.sidebar.success("تم مسح كاش LLM." if ok else "لا توجد بيانات كاش.")
 
 # Tabs
 tab_article, tab_comp, tab_qc = st.tabs(["✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى"])
@@ -159,13 +172,11 @@ with tab_article:
             category_choice = st.selectbox("الفئة", built_in_labels + ["فئة مخصّصة…"])
 
             if category_choice == "فئة مخصّصة…":
-                # حقن القيمة المعلّقة (إن وُجدت) قبل إنشاء Text Area
                 if "pending_custom_criteria_text" in st.session_state:
                     st.session_state["custom_criteria_text"] = st.session_state.pop("pending_custom_criteria_text")
 
                 custom_category_name = st.text_input("اسم الفئة المخصّصة", "مطاعم لبنانية", key="custom_category_name")
 
-                # لا نمرّر value إذا كان المفتاح موجودًا؛ فقط أول تشغيل
                 DEFAULT_CRIT_MD = (
                     "- **التجربة المباشرة:** زيارات متعدّدة وتجربة أطباق أساسية ومعروفة في المطبخ.\n"
                     "- **المكوّنات:** جودة اللحوم/الأسماك/الأجبان والخضروات الطازجة.\n"
@@ -197,10 +208,8 @@ with tab_article:
 
         # ---------- دوال تطبيع العرض + زر/خيار جلب/توليد معايير الفئة ----------
         def _normalize_criteria(raw):
-            """حوّل أي ناتج (list/tuple/dict/str JSON) إلى قائمة نصوص نظيفة بلا undefined."""
             if raw is None:
                 return []
-            # لو نص قد يكون JSON
             if isinstance(raw, str):
                 s = raw.strip()
                 if s.startswith(("[", "{")):
@@ -212,7 +221,6 @@ with tab_article:
                 else:
                     lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
                     return [ln for ln in lines if ln and ln.lower() != "undefined"]
-            # لو dict: جرّب مفاتيح شائعة أو خذ القيم/المفاتيح
             if isinstance(raw, dict):
                 for k in ("criteria", "bullets", "items", "list"):
                     if k in raw:
@@ -221,7 +229,6 @@ with tab_article:
                 else:
                     vals = list(raw.values())
                     raw = vals if all(isinstance(v, str) for v in vals) else list(raw.keys())
-            # اعتبرها قائمة
             if isinstance(raw, (list, tuple)):
                 out = []
                 for x in raw:
@@ -255,24 +262,20 @@ with tab_article:
                     catalog_path="data/criteria_catalog.yaml"
                 )
                 md = _format_criteria_md(crit_list)
-                # نظّف أي قيمة قديمة مخزنة
                 st.session_state["criteria_generated_md_map"].pop(effective_category, None)
                 st.session_state["criteria_generated_md_map"][effective_category] = md
 
                 if is_custom_category:
-                    # لا نلمس مفتاح الويجت مباشرة؛ نحفظ قيمة معلّقة ثم rerun
                     st.session_state["pending_custom_criteria_text"] = md
                     safe_rerun()
                 else:
                     st.success("تم توليد المعايير وحفظها.")
 
-            # (اختياري) عرض آخر توليد محفوظ لهذه الفئة
             if effective_category in st.session_state["criteria_generated_md_map"]:
                 st.markdown("**المعايير (تلقائي):**")
                 st.markdown(st.session_state["criteria_generated_md_map"][effective_category])
         # ---------- /انتهى ----------
 
-        # مصدر criteria_block النهائي
         if is_custom_category:
             criteria_block = st.session_state.get("custom_criteria_text", criteria_block)
         else:
@@ -365,7 +368,13 @@ with tab_article:
             {"role": "user", "content": base_prompt},
         ]
         try:
-            article_md = chat_complete(client, base_messages, max_tokens=2200, temperature=0.7, model=primary_model, fallback_model=fallback_model)
+            article_md = chat_complete_cached(
+                client, base_messages,
+                max_tokens=2200, temperature=0.7,
+                model=primary_model, fallback_model=fallback_model,
+                cacher=st.session_state["llm_cacher"],
+                cache_extra={"task":"article_base"}
+            )
         except Exception as e:
             st.error(f"فشل التوليد: {e}")
             st.stop()
@@ -373,26 +382,46 @@ with tab_article:
         apply_polish = add_human_touch or any(checks.values())
         merged_user_notes = (st.session_state.get("comp_gap_notes","") + "\n" + (manual_notes or "")).strip()
         if apply_polish or merged_user_notes:
-            polish_prompt = read_prompt("polish.md").format(article=article_md, user_notes=merged_user_notes)
+            polish_prompt = POLISH_TMPL.format(article=article_md, user_notes=merged_user_notes)
             polish_messages = [
                 {"role": "system", "content": "أنت محرر عربي محترف، تحافظ على الحقائق وتضيف لمسات بشرية بدون مبالغة."},
                 {"role": "user", "content": polish_prompt},
             ]
             try:
-                article_md = chat_complete(client, polish_messages, max_tokens=2400, temperature=0.8, model=primary_model, fallback_model=fallback_model)
+                article_md = chat_complete_cached(
+                    client, polish_messages,
+                    max_tokens=2400, temperature=0.8,
+                    model=primary_model, fallback_model=fallback_model,
+                    cacher=st.session_state["llm_cacher"],
+                    cache_extra={"task":"polish"}
+                )
             except Exception as e:
                 st.warning(f"طبقة اللمسات البشرية تعذّرت: {e}")
 
         meta_prompt = f"صِغ عنوان SEO (≤ 60) ووصف ميتا (≤ 155) بالعربية لمقال بعنوان \"{article_title}\". الكلمة المفتاحية: {keyword}.\nTITLE: ...\nDESCRIPTION: ..."
         try:
-            meta_out = chat_complete(client, [{"role":"system","content":"أنت مختص SEO عربي."},{"role":"user","content": meta_prompt}], max_tokens=200, temperature=0.6, model=primary_model, fallback_model=fallback_model)
+            meta_out = chat_complete_cached(
+                client,
+                [{"role":"system","content":"أنت مختص SEO عربي."},{"role":"user","content": meta_prompt}],
+                max_tokens=200, temperature=0.6,
+                model=primary_model, fallback_model=fallback_model,
+                cacher=st.session_state["llm_cacher"],
+                cache_extra={"task":"meta"}
+            )
         except Exception:
             meta_out = f"TITLE: {article_title}\nDESCRIPTION: دليل عملي عن {keyword}."
 
         links_catalog = [s.strip() for s in internal_catalog.splitlines() if s.strip()]
         links_prompt = f"اقترح 3 روابط داخلية مناسبة من هذه القائمة إن أمكن:\n{links_catalog}\nالعنوان: {article_title}\nالنطاق: {content_scope}\nالفئة: {category}\nالمدينة/المكان: {place_name or city_input}\nمقتطف:\n{article_md[:800]}\n- رابط داخلي مقترح: <النص>\n- رابط داخلي مقترح: <النص>\n- رابط داخلي مقترح: <النص>"
         try:
-            links_out = chat_complete(client, [{"role":"system","content":"أنت محرر عربي يقترح روابط داخلية طبيعية."},{"role":"user","content": links_prompt}], max_tokens=240, temperature=0.5, model=primary_model, fallback_model=fallback_model)
+            links_out = chat_complete_cached(
+                client,
+                [{"role":"system","content":"أنت محرر عربي يقترح روابط داخلية طبيعية."},{"role":"user","content": links_prompt}],
+                max_tokens=240, temperature=0.5,
+                model=primary_model, fallback_model=fallback_model,
+                cacher=st.session_state["llm_cacher"],
+                cache_extra={"task":"internal_links"}
+            )
         except Exception:
             links_out = "- رابط داخلي مقترح: أفضل مطاعم الرياض\n- رابط داخلي مقترح: دليل مطاعم العائلات في الرياض\n- رابط داخلي مقترح: مقارنة بين الأنماط"
 
@@ -468,7 +497,13 @@ with tab_comp:
             client = get_client()
             try:
                 with st.spinner("يشغّل التحليل..."):
-                    analysis_md = analyze_competitors(client, primary_model, fallback_model, pages["A"], pages["B"], query, place_scope_desc or "—", tone_for_analysis, reviews_weight_analysis)
+                    analysis_md = analyze_competitors(
+                        client, primary_model, fallback_model,
+                        pages["A"], pages["B"],
+                        query, place_scope_desc or "—",
+                        tone_for_analysis, reviews_weight_analysis,
+                        cacher=st.session_state["llm_cacher"]
+                    )
                 st.session_state["comp_analysis_md"] = analysis_md
                 st.subheader("📊 تقرير التحليل"); st.markdown(analysis_md)
                 gaps = extract_gap_points(analysis_md)
@@ -533,7 +568,7 @@ with tab_qc:
             st.error("لا يوجد OPENAI_API_KEY.")
         else:
             client = get_client()
-            out = llm_review(client, primary_model, fallback_model, qc_text)
+            out = llm_review(client, primary_model, fallback_model, qc_text, cacher=st.session_state["llm_cacher"])
             st.markdown("### تقرير المُراجع"); st.markdown(out)
             st.session_state["qc_review_md"] = out
 
@@ -549,7 +584,7 @@ with tab_qc:
             st.error("لا يوجد OPENAI_API_KEY.")
         else:
             client = get_client()
-            new_text = llm_fix(client, primary_model, fallback_model, qc_text, flagged_block.splitlines())
+            new_text = llm_fix(client, primary_model, fallback_model, qc_text, flagged_block.splitlines(), cacher=st.session_state["llm_cacher"])
             st.markdown("### النص بعد الإصلاح"); st.markdown(new_text)
             st.session_state["last_article_md"] = new_text
             st.success("تم الإصلاح الموضعي.")
