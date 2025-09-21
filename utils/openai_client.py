@@ -1,6 +1,7 @@
 import os
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openai import OpenAI
+from utils.llm_cache import LLMCacher
 import streamlit as st
 
 DEFAULT_MODEL = "gpt-4.1"
