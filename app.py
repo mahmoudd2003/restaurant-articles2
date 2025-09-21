@@ -2,12 +2,11 @@
 import os
 os.makedirs("data", exist_ok=True)
 
-# الاستيراد (حسب مكان الملف عندك)
 from utils.content_fetch import fetch_and_extract, configure_http_cache, clear_http_cache
 try:
     from category_criteria import get_category_criteria
 except ImportError:
-    from modules.category_criteria import get_category_criteria  # لو نقلته داخل utils/modules
+    from modules.category_criteria import get_category_criteria
 
 import io, csv, unicodedata, json
 from datetime import datetime
@@ -21,16 +20,17 @@ from utils.competitor_analysis import analyze_competitors, extract_gap_points
 from utils.quality_checks import quality_report
 from utils.llm_reviewer import llm_review, llm_fix
 from utils.llm_cache import LLMCacher
+from utils.keywords import parse_required_keywords, enforce_report, FIX_PROMPT
 
-# --- rerun آمن لنسخ ستريملت المختلفة ---
+# --- rerun آمن ---
 def safe_rerun():
     if getattr(st, "rerun", None):
-        st.rerun()  # Streamlit >= 1.30
+        st.rerun()
     else:
-        st.experimental_rerun()  # الإصدارات الأقدم
+        st.experimental_rerun()
 
 st.set_page_config(page_title="مولد مقالات المطاعم (E-E-A-T)", page_icon="🍽️", layout="wide")
-st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Human Touch + منافسين + فحص بشرية")
+st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Human Touch + منافسين + كلمات إلزامية + فحص بشرية")
 
 PROMPTS_DIR = Path("prompts")
 def read_prompt(name: str) -> str:
@@ -94,6 +94,13 @@ include_methodology = st.sidebar.checkbox("إضافة منهجية التحري�
 add_human_touch = st.sidebar.checkbox("تفعيل طبقة اللمسات البشرية (Polish)", value=True)
 approx_len = st.sidebar.slider("الطول التقريبي (كلمات)", 600, 1800, 1100, step=100)
 
+# —— الكلمات الإلزامية —— #
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧩 كلمات مرتبطة إلزامية")
+kw_help = "اكتب كل كلمة/عبارة بسطر مستقل. لإجبار تكرارها ضع | min=2 مثل: جلسات خارجية | min=2"
+required_kw_spec = st.sidebar.text_area("أدخل الكلمات الإلزامية", value="مطاعم عائلية\nجلسات خارجية | min=2", height=120, help=kw_help)
+required_list = parse_required_keywords(required_kw_spec)
+
 review_weight = None
 if tone in ["ناقد صارم | مراجعات الجمهور", "ناقد صارم | تجربة مباشرة + مراجعات"]:
     default_weight = 85 if tone == "ناقد صارم | مراجعات الجمهور" else 55
@@ -106,15 +113,14 @@ internal_catalog = st.sidebar.text_area(
     "أفضل مطاعم الرياض\nأفضل مطاعم إفطار في الرياض\nأفضل مطاعم بيتزا في جدة"
 )
 
-# —— إعدادات الكاش للطلبات الخارجية —— #
+# —— كاش HTTP —— #
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 الكاش (جلب الروابط)")
-use_cache = st.sidebar.checkbox("تفعيل الكاش", value=True, help="يُسرّع جلب الصفحات ويقلّل الطلبات الخارجية.")
-cache_hours = st.sidebar.slider("مدة الكاش (ساعات)", 1, 72, 24)
+use_cache = st.sidebar.checkbox("تفعيل كاش HTTP", value=True)
+cache_hours = st.sidebar.slider("مدة كاش HTTP (ساعات)", 1, 72, 24)
 if st.sidebar.button("🧹 مسح كاش HTTP"):
     ok = clear_http_cache()
-    st.sidebar.success("تم مسح كاش HTTP." if ok else "لم يتم العثور على بيانات كاش.")
-
+    st.sidebar.success("تم مسح كاش HTTP." if ok else "لا توجد بيانات كاش.")
 try:
     configure_http_cache(enabled=use_cache, hours=cache_hours)
 except Exception as e:
@@ -123,13 +129,12 @@ except Exception as e:
 # —— كاش LLM —— #
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 كاش الـLLM")
-llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش مخرجات LLM", value=True, help="يقلل الوقت والتكلفة أثناء التطوير.")
+llm_cache_enabled = st.sidebar.checkbox("تفعيل كاش مخرجات LLM", value=True)
 llm_cache_hours = st.sidebar.slider("مدة كاش LLM (ساعات)", 1, 72, 24)
 if "llm_cacher" not in st.session_state:
     st.session_state["llm_cacher"] = LLMCacher(ttl_hours=llm_cache_hours, enabled=llm_cache_enabled)
 else:
     st.session_state["llm_cacher"].configure(enabled=llm_cache_enabled, ttl_hours=llm_cache_hours)
-
 if st.sidebar.button("🧹 مسح كاش LLM"):
     ok = st.session_state["llm_cacher"].clear()
     st.sidebar.success("تم مسح كاش LLM." if ok else "لا توجد بيانات كاش.")
@@ -166,83 +171,64 @@ with tab_article:
         category = "عام"
         criteria_block = GENERAL_CRITERIA
 
-        # ---------------- تحديد الفئة وبناء النص الأولي + علامة هل هي مخصّصة ----------------
+        # اختيار الفئة
         is_custom_category = False
         if content_scope == "فئة محددة داخل المكان":
             category_choice = st.selectbox("الفئة", built_in_labels + ["فئة مخصّصة…"])
-
             if category_choice == "فئة مخصّصة…":
                 if "pending_custom_criteria_text" in st.session_state:
                     st.session_state["custom_criteria_text"] = st.session_state.pop("pending_custom_criteria_text")
-
                 custom_category_name = st.text_input("اسم الفئة المخصّصة", "مطاعم لبنانية", key="custom_category_name")
-
                 DEFAULT_CRIT_MD = (
-                    "- **التجربة المباشرة:** زيارات متعدّدة وتجربة أطباق أساسية ومعروفة في المطبخ.\n"
-                    "- **المكوّنات:** جودة اللحوم/الأسماك/الأجبان والخضروات الطازجة.\n"
-                    "- **طرق الطهي والأصالة:** التتبيل والتحمير/الشوي/الفرن ومدى اقتراب النكهة من الأصل.\n"
-                    "- **الأجواء والملاءمة:** جلسات عائلية/أصدقاء، مستوى الضجيج وراحة الجلسات.\n"
-                    "- **ثبات الجودة:** ملاحظة التماسك في الطعم والخدمة عبر زيارات وأوقات مختلفة."
+                    "- **التجربة المباشرة:** زيارات متعدّدة وتجربة أطباق أساسية.\n"
+                    "- **المكوّنات:** جودة وطزاجة.\n"
+                    "- **الأصالة/الطريقة:** التتبيل/الشوي/الفرن ومدى قرب النكهة من الأصل.\n"
+                    "- **الأجواء:** ملاءمة العائلات/الأصدقاء.\n"
+                    "- **ثبات الجودة:** عبر أوقات/زيارات مختلفة."
                 )
                 ta_kwargs = dict(key="custom_criteria_text", height=140)
                 if "custom_criteria_text" not in st.session_state:
                     ta_kwargs["value"] = DEFAULT_CRIT_MD
-
-                custom_criteria_text = st.text_area(
-                    "معايير الاختيار لهذه الفئة (يدوي — اختياري، سيتم استبدالها تلقائيًا عند الضغط على زر الجلب)",
-                    **ta_kwargs
-                )
-
+                custom_criteria_text = st.text_area("معايير الاختيار لهذه الفئة (اختياري)", **ta_kwargs)
                 category = (st.session_state.get("custom_category_name") or "فئة مخصّصة").strip()
-                criteria_block = st.session_state.get("custom_criteria_text") or "اعتمدنا على التجربة المباشرة، جودة المكونات، تنوع القائمة، وثبات الجودة."
+                criteria_block = st.session_state.get("custom_criteria_text") or "اعتمدنا على التجربة، جودة المكونات، تنوع القائمة، وثبات الجودة."
                 is_custom_category = True
             else:
                 category = category_choice
                 criteria_block = CRITERIA_MAP.get(category_choice, GENERAL_CRITERIA)
-                is_custom_category = False
         else:
             category = "عام"
             criteria_block = GENERAL_CRITERIA
-            is_custom_category = False
-        # ---------------------------------------------------------------------
 
-        # ---------- دوال تطبيع العرض + زر/خيار جلب/توليد معايير الفئة ----------
+        # زر/خيار جلب/توليد معايير الفئة
         def _normalize_criteria(raw):
-            if raw is None:
-                return []
+            if raw is None: return []
             if isinstance(raw, str):
                 s = raw.strip()
-                if s.startswith(("[", "{")):
-                    try:
-                        raw = json.loads(s)
+                import json as _json, re as _re
+                if s.startswith(("[","{"])):
+                    try: raw = _json.loads(s)
                     except Exception:
                         lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
-                        return [ln for ln in lines if ln and ln.lower() != "undefined"]
+                        return [ln for ln in lines if ln and ln.lower()!="undefined"]
                 else:
                     lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
-                    return [ln for ln in lines if ln and ln.lower() != "undefined"]
+                    return [ln for ln in lines if ln and ln.lower()!="undefined"]
             if isinstance(raw, dict):
-                for k in ("criteria", "bullets", "items", "list"):
-                    if k in raw:
-                        raw = raw[k]
-                        break
+                for k in ("criteria","bullets","items","list"):
+                    if k in raw: raw = raw[k]; break
                 else:
                     vals = list(raw.values())
-                    raw = vals if all(isinstance(v, str) for v in vals) else list(raw.keys())
-            if isinstance(raw, (list, tuple)):
-                out = []
+                    raw = vals if all(isinstance(v,str) for v in vals) else list(raw.keys())
+            if isinstance(raw, (list,tuple)):
+                out=[]
                 for x in raw:
-                    if isinstance(x, str):
-                        t = x.strip().strip(",").strip('"').strip("'")
-                    elif isinstance(x, dict) and "text" in x:
-                        t = str(x["text"]).strip()
-                    else:
-                        t = str(x).strip()
-                    if t and t.lower() != "undefined":
-                        out.append(t)
+                    if isinstance(x,str): t=x.strip().strip(",").strip('"').strip("'")
+                    elif isinstance(x,dict) and "text" in x: t=str(x["text"]).strip()
+                    else: t=str(x).strip()
+                    if t and t.lower()!="undefined": out.append(t)
                 return out
             return [str(raw)]
-
         def _format_criteria_md(items):
             items = _normalize_criteria(items)
             return "\n".join(f"- {c}" for c in items) or "- —"
@@ -253,28 +239,20 @@ with tab_article:
 
         with st.expander("📋 معايير الاختيار لهذه الفئة (تلقائي/يدوي)", expanded=False):
             st.caption(f"الفئة الحالية: **{effective_category}**")
-            use_llm = st.checkbox("تعزيز بالـ LLM (اختياري)", value=False, key="crit_llm",
-                                  help="يتطلب OPENAI_API_KEY إن فعّلته، وإلا تُستخدم Heuristics.")
+            use_llm = st.checkbox("تعزيز بالـ LLM (اختياري)", value=False, key="crit_llm")
             if st.button("جلب/توليد معايير الفئة", key="btn_generate_criteria"):
-                crit_list = get_category_criteria(
-                    effective_category,
-                    use_llm=use_llm,
-                    catalog_path="data/criteria_catalog.yaml"
-                )
+                crit_list = get_category_criteria(effective_category, use_llm=use_llm, catalog_path="data/criteria_catalog.yaml")
                 md = _format_criteria_md(crit_list)
                 st.session_state["criteria_generated_md_map"].pop(effective_category, None)
                 st.session_state["criteria_generated_md_map"][effective_category] = md
-
                 if is_custom_category:
                     st.session_state["pending_custom_criteria_text"] = md
                     safe_rerun()
                 else:
                     st.success("تم توليد المعايير وحفظها.")
-
             if effective_category in st.session_state["criteria_generated_md_map"]:
                 st.markdown("**المعايير (تلقائي):**")
                 st.markdown(st.session_state["criteria_generated_md_map"][effective_category])
-        # ---------- /انتهى ----------
 
         if is_custom_category:
             criteria_block = st.session_state.get("custom_criteria_text", criteria_block)
@@ -283,7 +261,7 @@ with tab_article:
 
         restaurants_input = st.text_area("أدخل أسماء المطاعم (سطر لكل مطعم)", "مطعم 1\nمطعم 2\nمطعم 3", height=160)
         st.markdown("**أو** ارفع ملف CSV بأسماء المطاعم (عمود: name)")
-        csv_file = st.file_uploader("رفع CSV (اختياري)", type=["csv"], help="عمود name مطلوب؛ عمود note اختياري.")
+        csv_file = st.file_uploader("رفع CSV (اختياري)", type=["csv"])
 
         def _normalize_name(s: str) -> str:
             return " ".join((s or "").strip().split())
@@ -356,15 +334,22 @@ with tab_article:
         last_updated = datetime.now().strftime("%B %Y")
         methodology_block = METH_TMPL.format(last_updated=last_updated) if include_methodology else "—"
 
+        # كتلة الكلمات الإلزامية للحقن في البرومبت
+        if required_list:
+            req_md = "\n".join([f"- **{kw}** — حد أدنى: {need} مرّة" for kw, need in required_list])
+        else:
+            req_md = "—"
+
         base_prompt = BASE_TMPL.format(
             title=article_title, keyword=keyword, content_scope=content_scope, category=category,
             restaurants_list=", ".join(restaurants), criteria_block=criteria_block, faq_block=faq_block,
             methodology_block=methodology_block, tone_label=tone, place_context=place_context,
             protip_hint=protip_hint, scope_instructions=scope_instructions, tone_instructions=tone_instructions,
-            tone_selection_line=tone_selection_line.replace("{last_updated}", last_updated)
+            tone_selection_line=tone_selection_line.replace("{last_updated}", last_updated),
+            required_keywords_block=req_md, approx_len=approx_len
         )
         base_messages = [
-            {"role": "system", "content": f"اكتب المقال بالعربية الفصحى. {system_tone}. طول تقريبي {approx_len} كلمة."},
+            {"role": "system", "content": f"اكتب المقال بالعربية الفصحى. {system_tone}. طول تقريبي {approx_len} كلمة. أدخِل الكلمات الإلزامية دون حشو."},
             {"role": "user", "content": base_prompt},
         ]
         try:
@@ -373,7 +358,7 @@ with tab_article:
                 max_tokens=2200, temperature=0.7,
                 model=primary_model, fallback_model=fallback_model,
                 cacher=st.session_state["llm_cacher"],
-                cache_extra={"task":"article_base"}
+                cache_extra={"task":"article_base", "required": required_list}
             )
         except Exception as e:
             st.error(f"فشل التوليد: {e}")
@@ -398,6 +383,45 @@ with tab_article:
             except Exception as e:
                 st.warning(f"طبقة اللمسات البشرية تعذّرت: {e}")
 
+        # ——— فحص الكلمات الإلزامية بعد التوليد ———
+        kw_report = enforce_report(article_md, required_list)
+        st.subheader("🧩 التزام الكلمات الإلزامية")
+        if not required_list:
+            st.caption("لم تُحدّد كلمات إلزامية.")
+        else:
+            # عرض جدول بسيط
+            rows = []
+            for item in kw_report["items"]:
+                status = "✅" if item["ok"] else "❌"
+                rows.append(f"- {status} **{item['keyword']}** — مطلوب {item['min']}, وُجدت {item['found']}")
+            st.markdown("\n".join(rows))
+
+            if not kw_report["ok"]:
+                needs_lines = "\n".join([f"- {m['keyword']}: نحتاج +{m['need']}" for m in kw_report["missing"]])
+                if st.button("✍️ إدماج تلقائي للكلمات الناقصة (دون حشو)"):
+                    fix_msgs = [
+                        {"role": "system", "content": "أنت محرر عربي دقيق تُدخل كلمات مطلوبة بنعومة وبدون حشو."},
+                        {"role": "user", "content": FIX_PROMPT.format(orig=article_md[:12000], needs=needs_lines)}
+                    ]
+                    try:
+                        article_md = chat_complete_cached(
+                            client, fix_msgs,
+                            max_tokens=2400, temperature=0.5,
+                            model=primary_model, fallback_model=fallback_model,
+                            cacher=st.session_state["llm_cacher"],
+                            cache_extra={"task":"kw_fix", "needs": kw_report["missing"]}
+                        )
+                        # إعادة فحص سريع
+                        kw_report = enforce_report(article_md, required_list)
+                        st.success("تم إدماج الكلمات المطلوبة.")
+                        st.markdown("\n".join(
+                            [f"- {'✅' if it['ok'] else '❌'} **{it['keyword']}** — مطلوب {it['min']}, وُجدت {it['found']}"
+                             for it in kw_report["items"]]
+                        ))
+                    except Exception as e:
+                        st.warning(f"تعذّر الإدماج التلقائي: {e}")
+
+        # ——— بقية التدفق (Meta/روابط/عرض/تصدير) ———
         meta_prompt = f"صِغ عنوان SEO (≤ 60) ووصف ميتا (≤ 155) بالعربية لمقال بعنوان \"{article_title}\". الكلمة المفتاحية: {keyword}.\nTITLE: ...\nDESCRIPTION: ..."
         try:
             meta_out = chat_complete_cached(
@@ -451,6 +475,8 @@ with tab_article:
         with colC:
             json_data = st.session_state.get('last_json', '{}')
             st.download_button('🧩 تنزيل JSON', data=json_data, file_name='article.json', mime='application/json')
+
+# ------------------ Tab 2 & 3 تبقى كما في نسختك المحدثة السابقة ------------------
 
 # ------------------ Tab 2: Competitor Analysis ------------------
 with tab_comp:
