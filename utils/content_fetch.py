@@ -22,13 +22,13 @@ def configure_http_cache(enabled: bool = True, hours: int = 24, backend: str = "
     تهيئة/تعطيل الكاش لطلبات HTTP عبر requests-cache.
     - enabled: تفعيل/تعطيل الكاش
     - hours: مدة الصلاحية
-    - backend: 'sqlite' أو 'filesystem' (اختياري)
+    - backend: 'sqlite' أو 'filesystem'
     - name: اسم قاعدة الكاش
     """
     global _CACHE_INSTALLED
     if not requests_cache:
         return False
-    # أزل أي إعداد سابق
+    # إزالة أي إعداد سابق
     if _CACHE_INSTALLED:
         try:
             requests_cache.uninstall_cache()
@@ -58,7 +58,7 @@ def clear_http_cache() -> bool:
     except Exception:
         return False
 
-# تهيئة افتراضية قابلة للتحكم عبر المتغيرات البيئية (لو لم تُستدعَ من الواجهة):
+# تهيئة افتراضية قابلة للتحكم عبر المتغيرات البيئية
 if requests_cache:
     _default_enabled = os.getenv("HTTP_CACHE_ENABLED", "1") == "1"
     _default_hours = int(os.getenv("HTTP_CACHE_HOURS", "24"))
@@ -75,7 +75,6 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ContentAuditBot/1.0; +https:/
 def fetch_url(url: str, timeout: int = 15) -> str:
     resp = requests.get(url, headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
-    # تسجيل بسيط يساعدك في تتبع الضربات من الكاش في لوج الخادم
     if hasattr(resp, "from_cache"):
         print(f"[http-cache] {'HIT ' if resp.from_cache else 'MISS'} {url}")
     return resp.text
