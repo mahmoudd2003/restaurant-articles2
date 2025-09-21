@@ -1,17 +1,21 @@
-# app.py — نسخة كاملة محدثة (دمج سطحي نظيف مع Google Places + ثبات ساعات الخميس)
-# ==================================================================================
+# app.py — نسخة كاملة محدثة (دمج سطحي نظيف مع Google Places + ثبات ساعات الخميس + النشر لووردبريس)
+# =====================================================================================================
 # يتضمن:
-# - تبويب 🛰️ Google Places (جلب & تنقية & اعتماد قائمة) — ساعات العمل ثابتة على "الخميس"
-# - تمرير Snapshot المعتمد إلى مولّد المقال ليُستخدم كوقود حقائق + مراجع
-# - كاش HTTP + كاش LLM + كلمات إلزامية + FAQ مدعوم بالمراجع + JSON-LD + منافسين + QC
-# ملاحظات:
-# - تأكد من وجود الملفات المساندة في utils/: content_fetch, openai_client, exporters, competitor_analysis,
-#   quality_checks, llm_reviewer, llm_cache, keywords, references, places_provider
-# - ضع مفاتيحك في .streamlit/secrets.toml (GOOGLE_API_KEY, OPENAI_API_KEY, ... إلخ)
-# ==================================================================================
+# 1) تبويب 🛰️ Google Places (جلب & تنقية & اعتماد قائمة) — ساعات العمل ثابتة على "الخميس"
+# 2) تمرير Snapshot المعتمد إلى مولّد المقال ليُستخدم كوقود حقائق + مراجع (مع كلمات إلزامية + FAQ + JSON-LD)
+# 3) تبويب 📝 النشر على ووردبريس (Draft/Publish) مع upsert ومنع التكرار + تصنيفات/وسوم + تضمين JSON-LD
+#
+# المتطلبات:
+# - ضع مفاتيحك في .streamlit/secrets.toml:
+#   GOOGLE_API_KEY, OPENAI_API_KEY, WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD
+# - تأكد من وجود الوحدات التالية في utils/:
+#   content_fetch.py, openai_client.py, exporters.py, competitor_analysis.py, quality_checks.py,
+#   llm_reviewer.py, llm_cache.py, keywords.py, references.py, places_provider.py, wp_client.py
+# =====================================================================================================
 
 import os
 import io
+import re
 import csv
 import json
 import unicodedata
@@ -26,10 +30,8 @@ os.makedirs("data", exist_ok=True)
 # --- استيرادات داخلية ---
 from utils.content_fetch import fetch_and_extract, configure_http_cache, clear_http_cache
 try:
-    # حسب مكان الملف لديك
     from category_criteria import get_category_criteria
 except ImportError:
-    # في حال نقلته داخل مجلد modules
     from modules.category_criteria import get_category_criteria
 
 from utils.openai_client import get_client, chat_complete_cached
@@ -40,13 +42,12 @@ from utils.llm_reviewer import llm_review, llm_fix
 from utils.llm_cache import LLMCacher
 from utils.keywords import parse_required_keywords, enforce_report, FIX_PROMPT
 from utils.references import normalize_refs, build_references_md, build_citation_map
-from utils.places_provider import (
-    get_places_dataset, references_from_places, facts_markdown
-)
+from utils.places_provider import get_places_dataset, references_from_places, facts_markdown
+from utils.wp_client import WPClient
 
 # --- إعداد الصفحة ---
 st.set_page_config(page_title="مولد مقالات المطاعم (E-E-A-T)", page_icon="🍽️", layout="wide")
-st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Google Places + كلمات إلزامية + مراجع + منافسين + QC")
+st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Google Places + كلمات إلزامية + مراجع + منافسين + QC + WordPress")
 
 # --- أدوات مساعدة ---
 def safe_rerun():
@@ -65,9 +66,9 @@ def _has_api_key() -> bool:
 
 def slugify(name: str) -> str:
     s = ''.join(c for c in unicodedata.normalize('NFKD', name) if not unicodedata.combining(c))
-    import re as _re
-    s = _re.sub(r'\W+', '_', s).strip('_').lower()
-    return s or "custom"
+    s = re.sub(r'\W+', '-', s).strip('-').lower()
+    s = re.sub(r'-{2,}', '-', s)
+    return s or "post"
 
 def get_secret(key, default=""):
     try:
@@ -78,6 +79,9 @@ def get_secret(key, default=""):
     return os.getenv(key, default)
 
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
+WP_BASE_URL    = get_secret("WP_BASE_URL", "")
+WP_USERNAME    = get_secret("WP_USERNAME", "")
+WP_APP_PASSWORD= get_secret("WP_APP_PASSWORD", "")
 
 PROMPTS_DIR = Path("prompts")
 def read_prompt(name: str) -> str:
@@ -189,7 +193,9 @@ if st.sidebar.button("🧹 مسح كاش LLM"):
     st.sidebar.success("تم مسح كاش LLM." if ok else "لا توجد بيانات كاش.")
 
 # ========================= Tabs =========================
-tab_places, tab_article, tab_comp, tab_qc = st.tabs(["🛰️ Google Places", "✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى"])
+tab_places, tab_article, tab_comp, tab_qc, tab_wp = st.tabs([
+    "🛰️ Google Places", "✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى", "📝 النشر على ووردبريس"
+])
 
 # ------------------ Tab 0: Google Places (جلب & تنقية) ------------------
 with tab_places:
@@ -221,7 +227,6 @@ with tab_places:
             st.success(f"تم الجلب: {len(places)} عنصرًا بعد التنقية والترتيب.")
             if len(places) < 6:
                 st.warning("القائمة أقل من 6 عناصر — قد تكون ضعيفة. جرّب خفض حدّ المراجعات أو توسيع الإستعلام.")
-            # عرض جدول مختصر
             import pandas as pd
             df = pd.DataFrame([{
                 "name": p["name"],
@@ -234,7 +239,6 @@ with tab_places:
                 "google_url": p.get("google_url"),
             } for p in places])
             st.dataframe(df, use_container_width=True)
-            # معاينة حقائق موجزة ستُغذي البرومبت
             st.markdown("#### حقائق مختصرة (ستُمرَّر للبرومبت — لا تُطبع كما هي):")
             st.markdown(facts_markdown(places))
         else:
@@ -246,7 +250,6 @@ with tab_places:
             st.warning("لا توجد قائمة جاهزة — اضغط أولًا (جلب النتائج).")
         else:
             st.session_state["places_snapshot"] = snap
-            # نبني مراجع تلقائيًا من الـSnapshot (روابط Google + مواقع رسمية)
             st.session_state["places_references"] = references_from_places(snap)
             st.success(f"تم اعتماد {len(snap)} عنصرًا. يمكنك الآن الانتقال لتبويب (توليد المقال).")
             st.markdown("**تنبيه:** هذه القائمة ستُستخدم كوقود حقائق للمقال، مع ذكر ساعات الخميس فقط.")
@@ -468,7 +471,7 @@ with tab_article:
         if include_faq:
             faq_prompt = (
                 "اكتب 5–8 أسئلة شائعة وإجابات قصيرة بالعربية.\n"
-                "إذا احتجت الاستشهاد بمصدر، استخدم حاشية [^n] برقم مرجعي من قسم \"المراجع\" أدناه.\n"
+                "إذا احتجت الاستشهاد بمصدر، استخدم حاشية [^ن] برقم مرجعي من قسم \"المراجع\" أدناه.\n"
                 f"المدينة/المكان: {place_name or city_input}\n"
                 f"الفئة: {category}\n"
                 "موضوعات مقترحة: الحجز/الذروة/الجلسات الخارجية/العائلات/اللباس/المواقف/طرق الدفع.\n"
@@ -655,7 +658,7 @@ with tab_article:
                     **({"reviewedBy": {"@type": "Person", "name": reviewer_name}} if reviewer_name else {}),
                     "isAccessibleForFree": True,
                     "mainEntityOfPage": {"@type": "WebPage", "name": article_title},
-                    "citation": list(citation_map.values()),  # روابط المراجع (Google + مواقع رسمية + يدوي)
+                    "citation": list(citation_map.values()),
                 }
             ]
         }
@@ -683,6 +686,7 @@ with tab_article:
             })
 
         jsonld_str = json.dumps(jsonld, ensure_ascii=False, indent=2)
+        st.session_state["jsonld_str"] = jsonld_str  # مهم: للتبويب الخاص بالنشر
         st.subheader("🧾 JSON-LD")
         st.code(jsonld_str, language="json")
         st.download_button("⬇️ تنزيل JSON-LD", data=jsonld_str, file_name=f"{slugify(article_title)}.json", mime="application/ld+json")
@@ -696,9 +700,10 @@ with tab_article:
             "include_faq": include_faq, "include_methodology": include_methodology,
             "article_markdown": article_md, "meta": meta_out, "internal_links": links_out,
             "references": list(citation_map.values()), "author": author_name, "reviewer": reviewer_name, "last_verified": last_verified,
-            "places_snapshot": st.session_state.get("places_snapshot", [])  # نحتفظ بالـSnapshot المعتمد
+            "places_snapshot": st.session_state.get("places_snapshot", [])
         }
         st.session_state['last_json'] = to_json(json_obj)
+        st.session_state['generated_title'] = article_title  # للاستخدام في تبويب النشر
 
     with col2:
         colA, colB, colC = st.columns(3)
@@ -761,8 +766,7 @@ with tab_comp:
                         client, primary_model, fallback_model,
                         pages["A"], pages["B"],
                         query, place_scope_desc or "—",
-                        tone_for_analysis, reviews_weight_analysis,
-                        cacher=st.session_state["llm_cacher"]
+                        tone_for_analysis, reviews_weight_analysis
                     )
                 st.session_state["comp_analysis_md"] = analysis_md
                 st.subheader("📊 تقرير التحليل"); st.markdown(analysis_md)
@@ -794,7 +798,6 @@ with tab_qc:
             rep = quality_report(qc_text)
             st.session_state["qc_report"] = rep
 
-            # بطاقة درجات مُوسّعة
             st.markdown("### بطاقة الدرجات")
             c1, c2, c3, c4 = st.columns(4)
             with c1: st.metric("Human-style", rep["human_style_score"])
@@ -863,7 +866,7 @@ with tab_qc:
             st.error("لا يوجد OPENAI_API_KEY.")
         else:
             client = get_client()
-            out = llm_review(client, primary_model, fallback_model, qc_text, cacher=st.session_state["llm_cacher"])
+            out = llm_review(client, primary_model, fallback_model, qc_text)
             st.markdown("### تقرير المُراجع"); st.markdown(out)
             st.session_state["qc_review_md"] = out
 
@@ -879,7 +882,103 @@ with tab_qc:
             st.error("لا يوجد OPENAI_API_KEY.")
         else:
             client = get_client()
-            new_text = llm_fix(client, primary_model, fallback_model, qc_text, flagged_block.splitlines(), cacher=st.session_state["llm_cacher"])
+            new_text = llm_fix(client, primary_model, fallback_model, qc_text, flagged_block.splitlines())
             st.markdown("### النص بعد الإصلاح"); st.markdown(new_text)
             st.session_state["last_article_md"] = new_text
             st.success("تم الإصلاح الموضعي.")
+
+# ------------------ Tab 4: Publish to WordPress ------------------
+with tab_wp:
+    st.subheader("📝 النشر على ووردبريس (Draft/Publish)")
+    with st.expander("إعدادات ووردبريس (من secrets.toml)", expanded=False):
+        st.code(f"WP_BASE_URL={WP_BASE_URL}\nWP_USERNAME={WP_USERNAME}\n(كلمة التطبيق مخفية)")
+
+    publishable = bool(st.session_state.get("last_article_md"))
+    if not publishable:
+        st.info("لا يوجد محتوى منشأ بعد. أنشئ المقال من تبويب ✍️ أولًا.")
+    else:
+        article_title_wp = st.text_input("عنوان ووردبريس", value=st.session_state.get("generated_title") or "مسودة: مقال مطاعم")
+        wp_status = st.selectbox("حالة النشر", ["draft", "publish"], index=0)
+        city_cat = st.text_input("تصنيف المدينة (Category)", value=st.session_state.get("city_for_wp") or "الرياض")
+        type_cat = st.text_input("تصنيف الفئة (Category)", value=st.session_state.get("type_for_wp") or "برجر")
+        extra_tags = st.text_input("وسوم (Tags) مفصولة بفواصل", value="مطاعم, عائلات, جلسات خارجية")
+
+        add_jsonld = st.checkbox("إرفاق JSON-LD داخل المحتوى", value=True, help="قد يتطلب صلاحية unfiltered_html")
+        add_snapshot_meta = st.checkbox("حفظ places_snapshot كـ meta (إن سمح الخادم) + تعليق مخفي داخل المحتوى", value=True)
+
+        st.markdown("#### معاينة مختصرة")
+        st.caption("المحتوى سيُنشر كما هو (Markdown/HTML). يمكنك تنسيقه لاحقًا داخل محرّر ووردبريس.")
+        st.text_area("نص المقال", value=st.session_state.get("last_article_md","")[:2000], height=180)
+
+        if st.button("🚀 نشر/تحديث (Upsert)"):
+            if not (WP_BASE_URL and WP_USERNAME and WP_APP_PASSWORD):
+                st.error("إعدادات ووردبريس غير مكتملة في secrets.toml")
+                st.stop()
+            try:
+                client = WPClient(WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD)
+                # حضّر التصنيفات والوسوم
+                cat_ids = []
+                if city_cat.strip():
+                    cid = client.ensure_category(city_cat.strip())
+                    if cid: cat_ids.append(cid)
+                if type_cat.strip():
+                    tid = client.ensure_category(type_cat.strip())
+                    if tid: cat_ids.append(tid)
+
+                tag_ids = []
+                for t in [x.strip() for x in extra_tags.split(",") if x.strip()]:
+                    tg = client.ensure_tag(t)
+                    if tg: tag_ids.append(tg)
+
+                # المحتوى: المقال + JSON-LD + تعليق مخفي للبيانات
+                article_md = st.session_state.get("last_article_md","")
+                content_parts = [article_md]
+
+                jsonld_str = st.session_state.get("jsonld_str")
+                if add_jsonld and jsonld_str:
+                    content_parts.append(f'<script type="application/ld+json">\n{jsonld_str}\n</script>')
+
+                # snapshot كتعليق مخفي
+                places_snapshot = st.session_state.get("places_snapshot", [])
+                if add_snapshot_meta and places_snapshot:
+                    try:
+                        snap_txt = json.dumps(places_snapshot, ensure_ascii=False)
+                    except Exception:
+                        snap_txt = "[]"
+                    content_parts.append(f"<!-- places_json:{snap_txt} -->")
+
+                content_html = "\n\n".join(content_parts)
+
+                # meta (قد تُرفض إن لم تُسجَّل مفاتيح meta في ووردبريس)
+                meta = {}
+                if add_snapshot_meta and places_snapshot:
+                    try:
+                        meta["places_json"] = places_snapshot
+                    except Exception:
+                        pass
+
+                slug = slugify(article_title_wp)
+                # excerpt صغير من Meta السابق إن توفر، وإلا من أول سطرين من المقال
+                meta_out = st.session_state.get("last_json", "{}")
+                try:
+                    meta_obj = json.loads(meta_out)
+                    excerpt = (meta_obj.get("meta") or "").replace("TITLE:", "").replace("DESCRIPTION:", "").strip()
+                    excerpt = excerpt.splitlines()[-1][:155] if excerpt else article_md[:155]
+                except Exception:
+                    excerpt = article_md[:155]
+
+                resp = client.upsert_post(
+                    title=article_title_wp or "مسودة بدون عنوان",
+                    slug=slug,
+                    content_html=content_html,
+                    status=wp_status,
+                    categories=cat_ids or None,
+                    tags=tag_ids or None,
+                    excerpt=excerpt,
+                    meta=meta or None
+                )
+                link = resp.get("link") or "(no link)"
+                st.success(f"تم النشر/التحديث بنجاح. الرابط: {link}")
+                st.write(resp)
+            except Exception as e:
+                st.error(f"فشل النشر: {e}")
