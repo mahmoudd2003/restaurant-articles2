@@ -3,6 +3,7 @@ import os
 os.makedirs("data", exist_ok=True)
 
 # الاستيراد (حسب مكان الملف عندك)
+from utils.content_fetch import fetch_and_extract, configure_http_cache, clear_http_cache
 try:
     from category_criteria import get_category_criteria
 except ImportError:
@@ -16,7 +17,6 @@ import streamlit as st
 
 from utils.openai_client import get_client, chat_complete
 from utils.exporters import to_docx, to_json
-from utils.content_fetch import fetch_and_extract
 from utils.competitor_analysis import analyze_competitors, extract_gap_points
 from utils.quality_checks import quality_report
 from utils.llm_reviewer import llm_review, llm_fix
@@ -104,6 +104,22 @@ internal_catalog = st.sidebar.text_area(
     "أدخل عناوين/سلاگز مقالاتك (سطر لكل عنصر)",
     "أفضل مطاعم الرياض\nأفضل مطاعم إفطار في الرياض\nأفضل مطاعم بيتزا في جدة"
 )
+
+# —— إعدادات الكاش للطلبات الخارجية —— #
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 الكاش (جلب الروابط)")
+use_cache = st.sidebar.checkbox("تفعيل الكاش", value=True, help="يُسرّع جلب الصفحات ويقلّل الطلبات الخارجية.")
+cache_hours = st.sidebar.slider("مدة الكاش (ساعات)", 1, 72, 24)
+if st.sidebar.button("🧹 مسح الكاش"):
+    ok = clear_http_cache()
+    st.sidebar.success("تم مسح الكاش." if ok else "لم يتم العثور على بيانات كاش.")
+
+# تطبيق إعداد الكاش
+try:
+    configure_http_cache(enabled=use_cache, hours=cache_hours)
+except Exception as e:
+    st.sidebar.warning(f"تعذّر تهيئة الكاش: {e}")
+# —— /انتهى —— #
 
 # Tabs
 tab_article, tab_comp, tab_qc = st.tabs(["✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى"])
