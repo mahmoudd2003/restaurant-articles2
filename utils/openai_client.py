@@ -1,31 +1,33 @@
 # utils/openai_client.py
+from typing import List, Dict, Any, Optional
 import os
-from functools import lru_cache
-from typing import List, Dict, Any
-from openai import OpenAI
 
-@lru_cache
-def get_client() -> OpenAI:
-    """
-    يبني عميل OpenAI مرة واحدة (مع كاش داخل العملية).
-    يعتمد على متغير البيئة OPENAI_API_KEY.
-    """
+# يدعم openai==1.x
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # سيتعامل app.py مع عدم توفره
+
+_client: Optional["OpenAI"] = None
+
+def _ensure_client() -> "OpenAI":
+    global _client
+    if _client is not None:
+        return _client
+    if OpenAI is None:
+        raise RuntimeError("openai package not installed")
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
-    return OpenAI(api_key=api_key)
+    _client = OpenAI(api_key=api_key)
+    return _client
 
-def chat_complete_cached(
-    messages: List[Dict[str, Any]],
-    model: str = "gpt-4o-mini",
-    **kwargs: Any
-):
+def chat_complete_cached(messages: List[Dict[str, Any]], model: str = "gpt-4o-mini", **kwargs):
     """
-    التفاف بسيط على Chat Completions API (openai==1.x).
-    لو عندك كاش خارجي تقدر تضيفه هنا قبل/بعد الاتصال.
+    التفاف مباشر على Chat Completions، بدون أقواس ناقصة :)
     """
-    client = get_client()
-    resp = client.chat.completions.create(
+    client = _ensure_client()
+    return client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=kwargs.get("temperature", 0.2),
@@ -35,4 +37,3 @@ def chat_complete_cached(
         frequency_penalty=kwargs.get("frequency_penalty"),
         seed=kwargs.get("seed"),
     )
-    return resp
