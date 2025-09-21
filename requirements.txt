@@ -1,0 +1,11 @@
+streamlit>=1.38
+openai>=1.40
+python-docx>=1.1.0
+PyYAML>=6.0.1
+tenacity>=8.2.3
+trafilatura>=1.6.3
+readability-lxml>=0.8.1
+beautifulsoup4>=4.12.2
+lxml>=4.9.3
+extruct>=0.16.0
+w3lib>=2.1.2
